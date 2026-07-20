@@ -1,0 +1,21 @@
+{
+  "jobs": [
+    {
+      "id": 555,
+      "title": "Software Engineer, New Grad",
+      "absolute_url": "https://boards.greenhouse.io/acme/jobs/555",
+      "location": {"name": "New York, NY"},
+      "first_published": "2026-07-01T09:00:00-04:00",
+      "updated_at": "2026-07-05T09:00:00-04:00",
+      "content": "&lt;p&gt;Build &lt;strong&gt;backend&lt;/strong&gt; systems.&lt;/p&gt;&lt;ul&gt;&lt;li&gt;Python&lt;/li&gt;&lt;li&gt;SQL&lt;/li&gt;&lt;/ul&gt;"
+    },
+    {
+      "id": 556,
+      "title": "Data Engineer",
+      "absolute_url": "https://boards.greenhouse.io/acme/jobs/556",
+      "location": {"name": "Remote"},
+      "content": "&lt;p&gt;Own ETL pipelines.&lt;/p&gt;"
+    }
+  ],
+  "meta": {"total": 2}
+}

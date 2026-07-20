@@ -1,0 +1,28 @@
+[
+  {
+    "source": "Simplify",
+    "company_name": "Goodco",
+    "id": "gh-ok",
+    "title": "Data Engineer, New Grad",
+    "date_posted": 1782000000,
+    "url": "https://boards.greenhouse.io/goodco/jobs/900",
+    "locations": ["Chicago, IL"],
+    "degrees": []
+  },
+  {
+    "source": "Simplify",
+    "company_name": "Nourl",
+    "id": "gh-nourl",
+    "title": "Software Engineer",
+    "date_posted": 1782000000,
+    "locations": ["Remote"]
+  },
+  {
+    "source": "Simplify",
+    "company_name": "Notitle",
+    "id": "gh-notitle",
+    "date_posted": 1782000000,
+    "url": "https://boards.greenhouse.io/notitle/jobs/901",
+    "locations": ["Remote"]
+  }
+]

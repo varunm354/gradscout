@@ -1,0 +1,24 @@
+[
+  {
+    "id": "abc-1",
+    "text": "Backend Engineer, University Grad",
+    "categories": {
+      "location": "San Francisco, CA",
+      "team": "Platform",
+      "commitment": "Full Time"
+    },
+    "createdAt": 1751371200000,
+    "descriptionPlain": "Work on distributed APIs and services.",
+    "description": "<p>Work on distributed APIs and services.</p>",
+    "hostedUrl": "https://jobs.lever.co/acme/abc-1",
+    "applyUrl": "https://jobs.lever.co/acme/abc-1/apply",
+    "workplaceType": "hybrid"
+  },
+  {
+    "id": "def-2",
+    "text": "Machine Learning Engineer",
+    "categories": {"location": "Remote", "team": "AI"},
+    "description": "<p>Build <em>LLM</em> inference systems.</p>",
+    "applyUrl": "https://jobs.lever.co/acme/def-2/apply"
+  }
+]

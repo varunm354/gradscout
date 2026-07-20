@@ -1,0 +1,66 @@
+# GradScout configuration template.
+# Copy to config.yaml and edit. This file contains NO secrets (secrets are env vars).
+# The watchlist and sources are editable without changing any application code.
+
+candidate:
+  graduation_year: 2027
+  degree_level: bachelor            # informs deterministic eligibility rules
+  role_families: [backend, ai, data, product]
+  resume_variants: [backend, ai, data]
+
+# High-priority companies. company_priority: 1 = highest.
+# coverage_status is DERIVED at runtime (not set here):
+#   direct    -> a native ATS source (greenhouse/lever/ashby) is configured for this company
+#   indirect  -> only represented via a github_repo source
+#   not_configured -> on watchlist but no source covers it
+#   failed    -> its direct source errored on the latest run
+# aliases help match the same company across differently-named sources/repos.
+watchlist:
+  - name: Stripe
+    company_priority: 1
+    aliases: [stripe]
+  - name: OpenAI
+    company_priority: 1
+    aliases: [openai]
+  - name: Anthropic
+    company_priority: 1
+    aliases: [anthropic]
+
+# Native ATS sources. Configuring one here gives a watchlist company "direct" coverage.
+greenhouse:
+  - company: Stripe
+    board: stripe
+    company_priority: 1
+
+lever:
+  - company: LeverDemo
+    board: leverdemo
+    company_priority: 3
+
+# Note: Anthropic is on the watchlist but has NO direct source below, so it will
+# show coverage_status = not_configured (or indirect if a GitHub repo lists it) --
+# an honest example of not implying direct monitoring.
+ashby:
+  - company: OpenAI
+    board: openai
+    company_priority: 1
+
+# GitHub new-grad repositories. These provide INDIRECT coverage only.
+# Prefer a structured JSON feed (simplify_json) over scraping the HTML README.
+github_repos:
+  - name: SimplifyJobs-NewGrad
+    url: https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json
+    parser: simplify_json
+
+# Keyword filters applied during normalization / role matching.
+include_keywords: [software engineer, backend, machine learning, data engineer, new grad, entry level]
+exclude_keywords: [senior, staff, principal, manager, director]
+
+notifications:
+  discord_min_priority: p2          # p1 | p2 | p3 : minimum priority to alert immediately
+  send_review_digest: true          # send Eligibility Review jobs in a separate low-priority section
+  max_alerts_per_run: 25            # cap PER RUN; unsent jobs stay pending and are delivered later
+  send_healthy_reports: false       # do NOT send hourly healthy summaries
+  daily_summary_hour_utc: 13        # send one daily success summary at this UTC hour
+  new_grad_recent_hours: 48         # "recently discovered" window for p1 urgency
+  max_years_experience: 5           # >= this many required years => ineligible (unless softened)

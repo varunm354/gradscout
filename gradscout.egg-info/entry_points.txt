@@ -1,0 +1,2 @@
+[console_scripts]
+gradscout = scripts.run:main

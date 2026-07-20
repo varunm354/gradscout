@@ -1,0 +1,3 @@
+# Local SQLite DB (gradscout.db) lives here and is gitignored on main.
+# In CI, the DB is restored from / saved to the dedicated orphan `state` branch,
+# NOT committed to main. See README "State persistence".

@@ -1,0 +1,28 @@
+{
+  "apiVersion": 1,
+  "jobs": [
+    {
+      "id": "a1",
+      "title": "Machine Learning Engineer, New Grad",
+      "department": "Engineering",
+      "team": "Applied AI",
+      "employmentType": "FullTime",
+      "location": "San Francisco, CA",
+      "isRemote": false,
+      "publishedAt": "2026-06-15T00:00:00.000Z",
+      "jobUrl": "https://jobs.ashbyhq.com/acme/a1",
+      "applyUrl": "https://jobs.ashbyhq.com/acme/a1/application",
+      "descriptionPlain": "Train and evaluate models.",
+      "descriptionHtml": "<p>Train and evaluate models.</p>"
+    },
+    {
+      "id": "a2",
+      "title": "Software Engineer",
+      "employmentType": "FullTime",
+      "location": "Remote",
+      "isRemote": true,
+      "jobUrl": "https://jobs.ashbyhq.com/acme/a2",
+      "descriptionHtml": "<p>Backend <strong>platform</strong> work.</p><ul><li>Go</li></ul>"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "jobs": [
+    {
+      "id": 601,
+      "title": "Backend Engineer, New Grad",
+      "absolute_url": "https://boards.greenhouse.io/acme/jobs/601",
+      "location": {"name": "Austin, TX"},
+      "first_published": "2026-07-10T09:00:00-04:00",
+      "content": "&lt;p&gt;APIs.&lt;/p&gt;"
+    },
+    {
+      "id": 602,
+      "location": {"name": "Boston, MA"},
+      "content": "&lt;p&gt;Missing title and absolute_url.&lt;/p&gt;"
+    }
+  ],
+  "meta": {"total": 2}
+}

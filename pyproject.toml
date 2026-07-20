@@ -1,0 +1,38 @@
+[project]
+name = "gradscout"
+version = "0.1.0"
+description = "Focused, reliable job-monitoring utility for 2027 new-grad and eligible early-career roles."
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+# Optional bounded LLM enrichment (Phase 3-4). The deterministic monitor must work without this.
+llm = [
+    "openai>=1.30",
+]
+
+[project.scripts]
+gradscout = "scripts.run:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["gradscout", "gradscout.collectors", "gradscout.notify", "scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
