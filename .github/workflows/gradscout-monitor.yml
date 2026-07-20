@@ -1,0 +1,114 @@
+name: GradScout Monitor
+
+# Phase 5: unattended hourly execution with durable SQLite state kept on a
+# dedicated orphan `state` branch (never on `main`). See docs/PHASE_5_HANDOFF.md
+# for the full design and docs/PHASE_5_HANDOFF.md / README.md for setup.
+
+on:
+  schedule:
+    # Minute 17 (not top-of-hour) to reduce GitHub Actions scheduling congestion.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run the full pipeline without sending Discord alerts or saving state"
+        type: boolean
+        required: false
+        default: false
+
+# Least privilege: the only thing this workflow needs beyond read access to
+# checkout code is permission to push commits to the `state` branch.
+permissions:
+  contents: write
+
+# Only one STATE-WRITING run (schedule, or a manual non-dry-run) may be
+# in flight at a time, and an in-progress one is never cancelled -- that
+# would risk killing a run mid-push. Manual dry-runs never touch state, so
+# each gets its own unique group (keyed by run id) and never queues behind
+# a state-writing run.
+concurrency:
+  group: >-
+    ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true')
+        && format('gradscout-monitor-dryrun-{0}', github.run_id)
+        || 'gradscout-monitor-state' }}
+  cancel-in-progress: false
+
+env:
+  DB_PATH: data/gradscout.db
+  STATE_BRANCH: state
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[llm]"
+
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Print run mode
+        run: |
+          echo "trigger: ${{ github.event_name }}"
+          echo "dry_run: ${{ steps.mode.outputs.dry_run }}"
+
+      # config.yaml is not a secret -- it is supplied by being committed to
+      # main. This fails clearly (and cheaply, before installing/collecting
+      # anything else) if it's missing or still the example/demo config, for
+      # BOTH dry-run and real invocations, so a manual dry-run accurately
+      # tests deployment readiness.
+      - name: Check production config
+        run: python -m scripts.check_config --config config.yaml
+
+      - name: Restore state from '${{ env.STATE_BRANCH }}' branch
+        id: restore
+        run: python -m scripts.state_restore --db "$DB_PATH" --branch "$STATE_BRANCH"
+
+      - name: Run pipeline (real)
+        if: success() && steps.mode.outputs.dry_run == 'false'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python -m scripts.run --config config.yaml --db "$DB_PATH"
+
+      - name: Run pipeline (dry-run)
+        if: success() && steps.mode.outputs.dry_run == 'true'
+        env:
+          # Deliberately no DISCORD_WEBHOOK_URL: dry-run must send no Discord
+          # requests, so the secret is not even exposed to this step's env.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python -m scripts.run --config config.yaml --db "$DB_PATH" --dry-run
+
+      # Only reached if the pipeline step above succeeded (this workflow never
+      # suppresses a failure with an unconditional fallback) -- a failed run
+      # never reaches here, so the last known-good state on the `state`
+      # branch is never replaced.
+      - name: Save state to '${{ env.STATE_BRANCH }}' branch
+        if: success() && steps.mode.outputs.dry_run == 'false'
+        run: |
+          python -m scripts.state_save --db "$DB_PATH" --branch "$STATE_BRANCH" \
+            --prior-sha "${{ steps.restore.outputs.sha }}"
+
+      - name: Report state status (dry-run)
+        if: success() && steps.mode.outputs.dry_run == 'true'
+        run: |
+          echo "state changed: n/a (dry run -- state is never evaluated or saved)"

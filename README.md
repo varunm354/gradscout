@@ -73,20 +73,28 @@ boards, GitHub repos, keyword filters, notification thresholds). Secrets are env
 
 ## State persistence (GitHub Actions)
 
-State is kept on a **dedicated orphan `state` branch** (not on `main`, and the binary DB is
-never committed to `main`). Each hourly run:
+State is kept on a **dedicated orphan `state` branch** (not on `main`; the binary DB is
+never committed to `main`). Each hourly run (`.github/workflows/gradscout-monitor.yml`):
 
-1. checks out `main` for code, then restores `data/gradscout.db` from the `state` branch;
+1. checks out `main` for code, validates `config.yaml` is production-safe, then restores
+   `data/gradscout.db` from the `state` branch (via git plumbing -- the branch is never
+   checked out into the working tree);
 2. runs the pipeline;
-3. commits the updated DB back to the `state` branch only.
+3. on success only, commits the updated DB back to the `state` branch, guarded by
+   `--force-with-lease` so a concurrent run's newer state is never overwritten.
 
-The orphan `state` branch shares no history with `main`, so DB churn never pollutes code
-history. `workflow_dispatch` supports a manual `dry_run` input.
+The orphan `state` branch shares no history with `main` and, by construction, can only
+ever contain `data/gradscout.db` and a tiny machine-managed README -- never application
+code. `workflow_dispatch` supports a manual `dry_run` input; the hourly schedule fires at
+minute 17 (not top-of-hour). See `docs/PHASE_5_HANDOFF.md` for full setup, secrets,
+permissions, troubleshooting, and how to disable the schedule.
 
 ## Status
 
-Phases 0–4 complete and locally testable (`python -m scripts.run`). `scripts/collect.py`
-remains available as a network-only collector harness (no alerts, no classification).
-GitHub Actions scheduling and orphan `state`-branch persistence are Phase 5 and not
-yet implemented; runs today are local-only, against a local `data/gradscout.db`.
-See `docs/PHASE_4_HANDOFF.md` for a detailed handoff.
+Phases 0–5 complete. `scripts/collect.py` remains available as a network-only collector
+harness (no alerts, no classification). GradScout can run either locally
+(`python -m scripts.run`, against a local `data/gradscout.db`) or unattended on GitHub
+Actions with durable state on the `state` branch (see above and
+`docs/PHASE_5_HANDOFF.md`). **A production `config.yaml` must still be created and
+committed before the first real scheduled/manual run** -- see `docs/PHASE_5_HANDOFF.md`
+§"First real run".
