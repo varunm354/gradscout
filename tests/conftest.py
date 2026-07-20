@@ -26,6 +26,7 @@ def make_job(
     source: SourceType = SourceType.greenhouse,
     source_company: str = "acme",
     apply_url: str = "https://boards.greenhouse.io/acme/jobs/1",
+    location: str | None = None,
     raw_blob: dict | None = None,
 ) -> Job:
     return Job(
@@ -37,6 +38,7 @@ def make_job(
         company_priority=company_priority,
         title=title,
         description_text=description,
+        location=location,
         url_canonical=canonicalize_url(apply_url),
         raw_blob=raw_blob or {},
     )

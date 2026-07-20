@@ -2,14 +2,26 @@
 
 Design notes:
   * jobs           - one row per distinct posting, uniquely keyed by url_canonical.
+                     Carries a content_hash (see gradscout.changes) so a re-seen
+                     posting can be told apart from a materially edited one.
   * job_sources    - many-to-one mapping: every source that surfaced a job is kept,
                      so a role found via a native ATS *and* a GitHub repo merges into
                      one job while both source records are preserved.
   * source_health  - durable per-source status so "no new jobs" is only trusted when
-                     the latest check actually succeeded.
+                     the latest check actually succeeded, and so failure/recovery
+                     transitions can be detected by comparing against the prior row.
   * alerts         - one row per (job, channel). An alert starts 'pending' and only
                      becomes 'sent' via an explicit mark_alert_sent() after a
                      successful delivery, so capped runs never lose alerts.
+  * meta           - small operational key/value store (e.g. the UTC calendar date
+                     the daily health summary was last sent), so state survives
+                     across runs alongside the rest of the DB.
+
+``upsert_job`` deliberately only ever writes STRUCTURAL fields (title, location,
+description, etc.) and the content hash; it never touches classification columns.
+Classification is written separately via ``apply_classification`` so a re-seen,
+content-unchanged job's last_seen_at can be bumped without being reclassified or
+re-alerted.
 
 Uses only the stdlib sqlite3. Timestamps are ISO8601 UTC strings.
 """
@@ -18,15 +30,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from gradscout.changes import compute_content_hash
 from gradscout.models import (
     AlertChannel,
     AlertState,
+    ChangeStatus,
     Job,
     JobRecord,
     JobSourceRecord,
+    ResolvedAnalysis,
     SourceStatus,
 )
 
@@ -42,6 +58,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     description_text   TEXT,
     apply_url          TEXT NOT NULL,
     source_posted_at   TEXT,
+    content_hash       TEXT NOT NULL DEFAULT '',
     first_seen_at      TEXT NOT NULL,
     last_seen_at       TEXT NOT NULL,
     eligibility_status TEXT NOT NULL,
@@ -94,6 +111,11 @@ CREATE TABLE IF NOT EXISTS alerts (
     PRIMARY KEY (job_id, channel)
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(channel, state);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -158,17 +180,32 @@ def _find_job_id(conn: sqlite3.Connection, job: Job) -> int | None:
     return int(row["job_id"]) if row else None
 
 
-def upsert_job(
-    conn: sqlite3.Connection, job: Job, now: datetime | None = None
-) -> tuple[int, bool]:
-    """Insert or merge a normalized job. Returns (job_id, created).
+@dataclass
+class UpsertResult:
+    job_id: int
+    status: ChangeStatus
 
-    Merges by stable source identity OR canonical URL. On merge, refreshes
-    last_seen_at and mutable classification fields but preserves first_seen_at,
-    and records/refreshes the job_sources mapping row for this source.
+    @property
+    def created(self) -> bool:
+        """Back-compat convenience: True only for a brand-new job."""
+        return self.status == ChangeStatus.created
+
+
+def upsert_job(conn: sqlite3.Connection, job: Job, now: datetime | None = None) -> UpsertResult:
+    """Insert or merge a normalized job, atomically classifying the result as
+    created / changed / unchanged by comparing a content hash of the
+    analysis-relevant fields (see gradscout.changes.compute_content_hash).
+
+    Merges by stable source identity OR canonical URL. Only STRUCTURAL fields
+    (title, location, description, apply_url, source_posted_at, content_hash)
+    and last_seen_at are written here; first_seen_at is preserved on merge.
+    Classification columns are left untouched -- callers apply those via
+    ``apply_classification`` only for created/changed jobs, so an unchanged
+    re-seen job is never redundantly reclassified or re-alerted.
     """
     now = now or _utcnow()
     now_s = now.isoformat()
+    new_hash = compute_content_hash(job)
     job_id = _find_job_id(conn, job)
 
     if job_id is None:
@@ -176,11 +213,12 @@ def upsert_job(
             """
             INSERT INTO jobs (
                 url_canonical, company, company_priority, title, location, remote,
-                description_text, apply_url, source_posted_at, first_seen_at,
-                last_seen_at, eligibility_status, eligibility_reasons, role_family,
-                role_priority, employment_type, is_new_grad, recommended_resume,
-                resume_confidence, resume_reason, alert_priority, llm_used, raw_blob
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                description_text, apply_url, source_posted_at, content_hash,
+                first_seen_at, last_seen_at, eligibility_status, eligibility_reasons,
+                role_family, role_priority, employment_type, is_new_grad,
+                recommended_resume, resume_confidence, resume_reason, alert_priority,
+                llm_used, raw_blob
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 job.url_canonical,
@@ -192,6 +230,7 @@ def upsert_job(
                 job.description_text,
                 job.apply_url,
                 _iso(job.source_posted_at),
+                new_hash,
                 now_s,
                 now_s,
                 job.eligibility_status.value,
@@ -209,40 +248,76 @@ def upsert_job(
             ),
         )
         job_id = int(cur.lastrowid)
-        created = True
-    else:
-        conn.execute(
-            """
-            UPDATE jobs SET
-                last_seen_at=?, company_priority=?, source_posted_at=COALESCE(?, source_posted_at),
-                eligibility_status=?, eligibility_reasons=?, role_family=?, role_priority=?,
-                employment_type=?, is_new_grad=?, recommended_resume=?, resume_confidence=?,
-                resume_reason=?, alert_priority=?, llm_used=?
-            WHERE job_id=?
-            """,
-            (
-                now_s,
-                job.company_priority,
-                _iso(job.source_posted_at),
-                job.eligibility_status.value,
-                json.dumps(job.eligibility_reasons),
-                job.role_family.value,
-                job.role_priority,
-                job.employment_type.value,
-                _bool_to_int(job.is_new_grad),
-                job.recommended_resume.value if job.recommended_resume else None,
-                job.resume_confidence.value if job.resume_confidence else None,
-                job.resume_reason,
-                job.alert_priority.value,
-                int(job.llm_used),
-                job_id,
-            ),
-        )
-        created = False
+        _upsert_source(conn, job_id, job, now_s)
+        conn.commit()
+        return UpsertResult(job_id, ChangeStatus.created)
 
+    existing = conn.execute(
+        "SELECT content_hash FROM jobs WHERE job_id=?", (job_id,)
+    ).fetchone()
+    changed = (existing["content_hash"] or "") != new_hash
+
+    conn.execute(
+        """
+        UPDATE jobs SET
+            last_seen_at=?, company=?, title=?, location=?, remote=?,
+            description_text=?, apply_url=?,
+            source_posted_at=COALESCE(?, source_posted_at), content_hash=?
+        WHERE job_id=?
+        """,
+        (
+            now_s,
+            job.company,
+            job.title,
+            job.location,
+            _bool_to_int(job.remote),
+            job.description_text,
+            job.apply_url,
+            _iso(job.source_posted_at),
+            new_hash,
+            job_id,
+        ),
+    )
     _upsert_source(conn, job_id, job, now_s)
     conn.commit()
-    return job_id, created
+    return UpsertResult(job_id, ChangeStatus.changed if changed else ChangeStatus.unchanged)
+
+
+def apply_classification(
+    conn: sqlite3.Connection, job_id: int, resolved: ResolvedAnalysis
+) -> None:
+    """Persist a resolved classification onto an already-upserted job.
+
+    Only called for jobs whose upsert result was created/changed, so an
+    unchanged re-seen job's prior classification (and any alert already
+    enqueued/sent for it) is left untouched.
+    """
+    conn.execute(
+        """
+        UPDATE jobs SET
+            company_priority=?, eligibility_status=?, eligibility_reasons=?,
+            role_family=?, role_priority=?, employment_type=?, is_new_grad=?,
+            recommended_resume=?, resume_confidence=?, resume_reason=?,
+            alert_priority=?, llm_used=?
+        WHERE job_id=?
+        """,
+        (
+            resolved.company_priority,
+            resolved.eligibility_status.value,
+            json.dumps(resolved.eligibility_reasons),
+            resolved.role_family.value,
+            resolved.role_priority,
+            resolved.employment_type.value,
+            _bool_to_int(resolved.is_new_grad),
+            resolved.recommended_resume.value if resolved.recommended_resume else None,
+            resolved.resume_confidence.value if resolved.resume_confidence else None,
+            resolved.resume_reason,
+            resolved.alert_priority.value,
+            int(resolved.llm_used),
+            job_id,
+        ),
+    )
+    conn.commit()
 
 
 def _upsert_source(conn: sqlite3.Connection, job_id: int, job: Job, now_s: str) -> None:
@@ -377,6 +452,31 @@ def get_source_health(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM source_health ORDER BY company_priority, source_id"
     ).fetchall()
+
+
+def get_source_health_one(conn: sqlite3.Connection, source_id: str) -> sqlite3.Row | None:
+    """The prior health row for one source, read BEFORE record_source_result()
+    overwrites it, so callers can detect a healthy<->failed transition."""
+    return conn.execute(
+        "SELECT * FROM source_health WHERE source_id=?", (source_id,)
+    ).fetchone()
+
+
+# --------------------------------------------------------------------------- #
+# Meta (small operational key/value state, e.g. daily-summary bookkeeping)
+# --------------------------------------------------------------------------- #
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+    conn.commit()
 
 
 # --------------------------------------------------------------------------- #

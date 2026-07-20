@@ -50,6 +50,25 @@ def score_role_priority(elig: EligibilityAssessment, relevant: bool) -> int:
     return 3
 
 
+# Lower rank = more urgent. Used only to compare against the configured
+# discord_min_priority threshold; review/ineligible/unclassified never
+# qualify as an immediate per-job alert (review goes to the digest instead).
+_ALERT_PRIORITY_RANK = {
+    AlertPriority.p1: 1,
+    AlertPriority.p2: 2,
+    AlertPriority.p3: 3,
+    AlertPriority.review: 4,
+    AlertPriority.ineligible: 5,
+    AlertPriority.unclassified: 6,
+}
+
+
+def meets_min_priority(priority: AlertPriority, threshold: AlertPriority) -> bool:
+    """True if ``priority`` is at least as urgent as ``threshold`` (e.g. p1/p2
+    both meet a p2 threshold; p3 does not)."""
+    return _ALERT_PRIORITY_RANK[priority] <= _ALERT_PRIORITY_RANK[threshold]
+
+
 def score_alert_priority(
     status: EligibilityStatus,
     company_priority: int,

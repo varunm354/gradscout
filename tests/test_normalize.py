@@ -68,15 +68,14 @@ def test_cross_source_merge_ats_and_github_preserves_both_sources(load_fixture):
     assert ats_job.apply_url != repo_job.apply_url
     assert canonicalize_url(ats_job.apply_url) == canonicalize_url(repo_job.apply_url)
 
-    jid1, created1 = db.upsert_job(conn, ats_job)
-    jid2, created2 = db.upsert_job(conn, repo_job)
+    r1 = db.upsert_job(conn, ats_job)
+    r2 = db.upsert_job(conn, repo_job)
 
-    assert created1 is True
-    assert created2 is False          # merged
-    assert jid1 == jid2
+    assert r1.status.value == "created"
+    assert r1.job_id == r2.job_id     # merged, not a second job
     assert db.count_jobs(conn) == 1
 
-    rec = db.get_job(conn, jid1)
+    rec = db.get_job(conn, r1.job_id)
     sources = {s.source for s in rec.sources}
     assert sources == {SourceType.greenhouse, SourceType.github_repo}
     # both original apply URLs preserved on their respective source records

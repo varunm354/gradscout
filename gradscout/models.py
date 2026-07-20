@@ -94,6 +94,16 @@ class AlertState(str, Enum):
     sent = "sent"
 
 
+class ChangeStatus(str, Enum):
+    """Result of an atomic upsert: whether a job row was newly created, had a
+    material change to its analysis-relevant content, or was seen again
+    unchanged (e.g. only last_seen_at needs bumping)."""
+
+    created = "created"
+    changed = "changed"
+    unchanged = "unchanged"
+
+
 # --------------------------------------------------------------------------- #
 # Job models
 # --------------------------------------------------------------------------- #

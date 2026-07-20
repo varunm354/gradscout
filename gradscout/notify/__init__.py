@@ -1,7 +1,9 @@
 """Notification outputs.
 
-Planned:
-    discord.py -> webhook sender (dry-run aware; only marks an alert sent
-                  after Discord accepts it, so max_alerts_per_run never loses jobs).
-    health.py  -> failure-only immediate alerts + one daily success summary.
+discord.py -> the (single) webhook sender: per-job embeds for urgent/strong
+             matches, one batched digest for Eligibility Review jobs, and
+             short operational embeds for source failure/recovery and the
+             once-daily health summary. Dry-run aware; only gradscout.pipeline
+             calls mark_alert_sent(), and only after a successful (2xx)
+             delivery.
 """

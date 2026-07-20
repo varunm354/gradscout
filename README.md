@@ -37,7 +37,8 @@ cp .env.example .env                  # set DISCORD_WEBHOOK_URL for real sends
 
 # 4. Test / run
 pytest
-python -m scripts.run --dry-run      # no Discord sends, verbose logs
+python -m scripts.run --dry-run      # full pipeline, no Discord sends
+python -m scripts.run                # real run (needs DISCORD_WEBHOOK_URL)
 ```
 
 ## Configuration
@@ -84,4 +85,8 @@ history. `workflow_dispatch` supports a manual `dry_run` input.
 
 ## Status
 
-Phase 0 (scaffolding) in progress. See the plan in chat for phase breakdown.
+Phases 0–4 complete and locally testable (`python -m scripts.run`). `scripts/collect.py`
+remains available as a network-only collector harness (no alerts, no classification).
+GitHub Actions scheduling and orphan `state`-branch persistence are Phase 5 and not
+yet implemented; runs today are local-only, against a local `data/gradscout.db`.
+See `docs/PHASE_4_HANDOFF.md` for a detailed handoff.
