@@ -1,0 +1,211 @@
+# GradScout PRODUCTION configuration.
+# Generated from the approved 25-company watchlist proposal (see chat history /
+# docs/PHASE_5_HANDOFF.md §9.3). Contains NO secrets -- safe to commit to `main`.
+#
+# Direct Greenhouse/Lever/Ashby sources below were live-verified against the
+# real public board APIs immediately before this file was written (job counts
+# observed, not guessed). Companies without a verified direct source are kept
+# on the watchlist for company_priority matching, but rely on indirect
+# coverage via the Simplify GitHub feed -- see the `github_repos` section.
+
+candidate:
+  graduation_year: 2027
+  degree_level: bachelor
+  role_families: [backend, ai, data, product]
+  resume_variants: [backend, ai, data]
+
+# High-priority companies. company_priority: 1 = highest.
+# coverage_status is DERIVED at runtime (not set here):
+#   direct    -> a native ATS source (greenhouse/lever/ashby) is configured for this company
+#   indirect  -> only represented via a github_repo source
+#   not_configured -> on watchlist but no source covers it
+#   failed    -> its direct source errored on the latest run
+# aliases help match the same company across differently-named sources/repos.
+watchlist:
+  # --- Big Tech (priority 1) -- indirect only: no public Greenhouse/Lever/
+  # Ashby board exists for these; they use proprietary ATS platforms. Coverage
+  # is via the Simplify feed only. Kept at priority 1 so a Simplify-sourced hit
+  # still triggers urgent (P1-eligible) treatment.
+  - name: Google
+    company_priority: 1
+    aliases: [google, alphabet]
+  - name: Meta
+    company_priority: 1
+    aliases: [meta, facebook]
+  - name: Amazon
+    company_priority: 1
+    aliases: [amazon, aws]
+  - name: Microsoft
+    company_priority: 1
+    aliases: [microsoft]
+  - name: Apple
+    company_priority: 1
+    aliases: [apple]
+
+  # --- AI / AI Infrastructure (priority 1 for the two top labs, else 2) ---
+  - name: OpenAI
+    company_priority: 1
+    aliases: [openai]
+  - name: Anthropic
+    company_priority: 1
+    aliases: [anthropic]
+  - name: Databricks
+    company_priority: 2
+    aliases: [databricks]
+  - name: Perplexity AI
+    company_priority: 2
+    aliases: [perplexity, perplexity ai]
+  - name: Cohere
+    company_priority: 2
+    aliases: [cohere]
+  - name: Scale AI
+    company_priority: 2
+    aliases: [scale ai, scaleai]   # indirect only -- no verified direct board (see sources)
+
+  # --- Developer Tools / Cloud / Data (priority 2) ---
+  - name: Stripe
+    company_priority: 2
+    aliases: [stripe]
+  - name: Cloudflare
+    company_priority: 2
+    aliases: [cloudflare]
+  - name: Datadog
+    company_priority: 2
+    aliases: [datadog]
+  - name: MongoDB
+    company_priority: 2
+    aliases: [mongodb]
+  - name: GitLab
+    company_priority: 2
+    aliases: [gitlab]
+  - name: Elastic
+    company_priority: 2
+    aliases: [elastic, elasticsearch]
+  - name: Palantir
+    company_priority: 2
+    aliases: [palantir, palantir technologies]
+
+  # --- High-growth product companies (priority 2) ---
+  - name: Figma
+    company_priority: 2
+    aliases: [figma]
+  - name: Discord
+    company_priority: 2
+    aliases: [discord]
+  - name: Coinbase
+    company_priority: 2
+    aliases: [coinbase]
+  - name: Robinhood
+    company_priority: 2
+    aliases: [robinhood]
+  - name: Airbnb
+    company_priority: 2
+    aliases: [airbnb]
+  - name: Instacart
+    company_priority: 2
+    aliases: [instacart]
+  - name: Samsara
+    company_priority: 2
+    aliases: [samsara]
+
+# Native ATS sources. Configuring one here gives a watchlist company "direct"
+# coverage. Every entry below was live-verified (HTTP 200 + a real jobs array)
+# against the official public board API immediately before this file was
+# written. No slugs were guessed: companies with no confirmed board (Google,
+# Meta, Amazon, Microsoft, Apple, Scale AI) are intentionally absent here and
+# fall back to indirect (Simplify) coverage only.
+greenhouse:
+  - company: Anthropic
+    board: anthropic
+    company_priority: 1
+  - company: Databricks
+    board: databricks
+    company_priority: 2
+  - company: Stripe
+    board: stripe
+    company_priority: 2
+  - company: Cloudflare
+    board: cloudflare
+    company_priority: 2
+  - company: Datadog
+    board: datadog
+    company_priority: 2
+  - company: MongoDB
+    board: mongodb
+    company_priority: 2
+  - company: GitLab
+    board: gitlab
+    company_priority: 2
+  - company: Elastic
+    board: elastic
+    company_priority: 2
+  - company: Figma
+    board: figma
+    company_priority: 2
+  - company: Discord
+    board: discord
+    company_priority: 2
+  - company: Coinbase
+    board: coinbase
+    company_priority: 2
+  - company: Robinhood
+    board: robinhood
+    company_priority: 2
+  - company: Airbnb
+    board: airbnb
+    company_priority: 2
+  - company: Instacart
+    board: instacart
+    company_priority: 2
+  - company: Samsara
+    board: samsara
+    company_priority: 2
+
+lever:
+  - company: Palantir
+    board: palantir
+    company_priority: 2
+
+ashby:
+  - company: OpenAI
+    board: openai
+    company_priority: 1
+  - company: Perplexity AI
+    board: perplexity
+    company_priority: 2
+  - company: Cohere
+    board: cohere
+    company_priority: 2
+
+# GitHub new-grad repositories. These provide INDIRECT coverage only.
+# Prefer a structured JSON feed (simplify_json) over scraping the HTML README.
+# This is the sole coverage path for: Google, Meta, Amazon, Microsoft, Apple,
+# and Scale AI (no verified direct board), plus a backstop for every other
+# watchlist company and any company not on the watchlist at all.
+github_repos:
+  - name: SimplifyJobs-NewGrad
+    url: https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json
+    parser: simplify_json
+
+# Keyword filters -- DOCUMENTATION OF INTENT ONLY. NOT ACTIVE FILTERS.
+# As of this writing, gradscout/pipeline.py, gradscout/analyze.py,
+# gradscout/roles.py, and gradscout/eligibility.py never read
+# config.include_keywords / config.exclude_keywords -- role-family and
+# eligibility classification instead use fixed, hardcoded keyword vocabularies
+# in gradscout/roles.py and gradscout/eligibility.py. Editing the two lists
+# below currently has NO effect on which jobs are collected, classified, or
+# alerted. They are recorded here only to document search intent (2027
+# new-grad; backend/software engineering/platform/infrastructure; AI/ML/
+# applied AI; data engineering; product engineering) for a future phase that
+# may wire them into the classifier. Do not rely on them today.
+include_keywords: [new grad, "2027", entry level, early career, university grad, software engineer, backend, platform, infrastructure, site reliability, machine learning, applied ai, ai engineer, data engineer, data engineering, product engineer]
+exclude_keywords: [senior, staff, principal, director, manager, lead, architect, phd required]
+
+notifications:
+  discord_min_priority: p3          # p1 | p2 | p3 : minimum priority to alert immediately
+  send_review_digest: true          # send Eligibility Review jobs in a separate low-priority section
+  max_alerts_per_run: 25            # cap PER RUN; unsent jobs stay pending and are delivered later
+  send_healthy_reports: false       # do NOT send hourly healthy summaries
+  daily_summary_hour_utc: 13        # send one daily success summary at this UTC hour
+  new_grad_recent_hours: 48         # "recently discovered" window for p1 urgency
+  max_years_experience: 3           # >= this many required years => ineligible (unless softened)
