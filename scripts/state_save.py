@@ -1,10 +1,21 @@
-"""Persist data/gradscout.db to the dedicated orphan `state` branch (Phase 5).
+"""Persist data/gradscout.db to the dedicated orphan `state` branch (Phase 5;
+gzip-compressed as of Phase 5.1 -- see docs/PHASE_5_HANDOFF.md).
 
 Never checks out the `state` branch into the working tree. Builds a new
 commit purely from git plumbing (hash-object / mktree / commit-tree) whose
-tree contains ONLY `data/gradscout.db` and a tiny machine-managed README --
+tree contains ONLY `data/gradscout.db.gz` and a tiny machine-managed README --
 by construction, the branch can never end up holding anything else, whether
 this is the first commit ever made on it or the ten-thousandth.
+
+Phase 5.1: the first real production DB (~135.7 MB) exceeded GitHub's 100 MB
+per-file push limit, so the raw `data/gradscout.db` is deterministically
+gzip-compressed (``scripts/db_compression.py``) to `data/gradscout.db.gz`
+before hashing; that compressed path is the ONLY DB path ever written to the
+tree going forward (a legacy raw `data/gradscout.db` from an older commit is
+therefore naturally dropped on the next save -- see
+``scripts/state_restore.py`` for the read-side backward-compatibility
+fallback). If the compressed file would still exceed the limit, this raises a
+clear ``StateTooLargeError`` before ever attempting the push.
 
 Race-safety: if the branch already has history (``--prior-sha`` is set, from
 ``scripts/state_restore.py``'s output), the push uses `--force-with-lease`
@@ -39,18 +50,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from scripts.db_compression import compress_db, ensure_within_github_limit
+
 GitRunner = Callable[..., subprocess.CompletedProcess]
 
-DB_PATH_IN_BRANCH = "data/gradscout.db"
+DB_PATH_IN_BRANCH = "data/gradscout.db.gz"
 README_PATH_IN_BRANCH = "STATE_BRANCH_README.md"
 README_TEXT = (
     "# GradScout state branch\n\n"
     "This branch is machine-managed by `.github/workflows/gradscout-monitor.yml` "
     "(via `scripts/state_save.py`). It exists ONLY to durably persist the pipeline "
-    "database (`data/gradscout.db`) between hourly runs, and shares no commit "
-    "history with `main`.\n\n"
+    "database, gzip-compressed as `data/gradscout.db.gz`, between hourly runs, and "
+    "shares no commit history with `main`.\n\n"
     "Do not edit or merge this branch into `main`. Every commit here is produced "
-    "by the workflow and contains exactly this README and `data/gradscout.db` -- "
+    "by the workflow and contains exactly this README and `data/gradscout.db.gz` -- "
     "nothing else.\n"
 )
 AUTHOR_NAME = "gradscout-bot"
@@ -69,6 +82,7 @@ class SaveResult:
     changed: bool
     pushed: bool
     new_sha: str | None
+    compressed_size_bytes: int | None = None
 
 
 def _blob_sha_for_file(path: Path, git: GitRunner) -> str:
@@ -131,12 +145,19 @@ def save_state(
     if not db_path.exists():
         raise RuntimeError(f"cannot save state: {db_path} does not exist")
 
-    new_db_sha = _blob_sha_for_file(db_path, git)
+    gz_path = db_path.with_name(db_path.name + ".gz")
+    compressed_size = compress_db(db_path, gz_path)
+    ensure_within_github_limit(compressed_size, gz_path)
+
+    new_db_sha = _blob_sha_for_file(gz_path, git)
     old_db_sha = _blob_sha_at(prior_sha, DB_PATH_IN_BRANCH, git) if prior_sha else None
     changed = new_db_sha != old_db_sha
 
     if not changed and prior_sha is not None:
-        return SaveResult(changed=False, pushed=False, new_sha=prior_sha)
+        return SaveResult(
+            changed=False, pushed=False, new_sha=prior_sha,
+            compressed_size_bytes=compressed_size,
+        )
 
     readme_sha = _blob_sha_for_text(README_TEXT, git)
     tree_sha = _build_nested_tree(
@@ -170,7 +191,9 @@ def save_state(
             f"overwrite. git said: {push.stderr.strip()}"
         )
 
-    return SaveResult(changed=True, pushed=True, new_sha=new_sha)
+    return SaveResult(
+        changed=True, pushed=True, new_sha=new_sha, compressed_size_bytes=compressed_size
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -197,6 +220,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"state pushed: {result.pushed}")
     if result.new_sha:
         print(f"state branch tip: {result.new_sha}")
+    if result.compressed_size_bytes is not None:
+        print(f"state db size (compressed): {result.compressed_size_bytes:,} bytes")
     return 0
 
 

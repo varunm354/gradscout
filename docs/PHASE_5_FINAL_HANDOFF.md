@@ -181,3 +181,28 @@ The only concrete sandbox restriction found was unrelated: `git init`/`clone`/`r
 ## 14. Commit status
 
 **No Phase 5 changes have been committed or pushed.** Everything in §1–§13 exists only in the working tree on `feature/phase5-deployment`. No `state` branch exists locally or on `origin`. Step 1 of §13 is the first commit that will ever be made for this phase.
+
+## 15. Phase 5.1 — first production run fixes (also uncommitted)
+
+The first real GitHub Actions run (after §13 was carried out) surfaced two issues,
+both fixed in a follow-up chat -- see `docs/PHASE_5_HANDOFF.md` §14 for the full
+design writeup. Summary for the person about to commit/deploy this:
+
+1. **State exceeded GitHub's 100 MB file limit.** The first production DB
+   (~135.7 MB) was rejected on push, so state never persisted and every run
+   re-alerted everything. Fixed by deterministically gzip-compressing state to
+   `data/gradscout.db.gz` (new `scripts/db_compression.py`), with a clear
+   fail-fast if the compressed size would still exceed 100 MB, and backward-
+   compatible legacy-raw-path restore. No workflow YAML changes were needed.
+2. **Nontechnical roles were generating normal Discord alerts** (and inflating
+   the pending-alert queue to ~17,000 on the first run), because role/keyword
+   scoring ran over the full description with no title gate, and an
+   eligible-but-irrelevant job's priority fallback incorrectly still qualified
+   as a normal `p3` alert. Fixed with title-first technical relevance gating in
+   `gradscout/roles.py` (new `evaluate_title_gate()`) and `gradscout/eligibility.py`
+   (a new hard/soft step-0 rule), plus filtering closed (`active: false`)
+   listings out of the Simplify feed collector.
+
+Both fixes are purely deterministic (no LLM involvement), fully covered by new
+offline tests, and -- like all Phase 5 work -- **not committed or pushed**;
+they exist only in the working tree alongside everything else in this handoff.

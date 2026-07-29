@@ -41,6 +41,39 @@ def test_generic_swe_defaults_to_backend():
     )
 
 
+# --- Phase 5.1: title-first gating additional credible-family cases ---
+def test_site_reliability_engineer_classification():
+    assert _family("Site Reliability Engineer, New Grad", "On-call, uptime, incident response.") == (
+        RoleFamily.backend
+    )
+
+
+def test_platform_engineer_classification():
+    assert _family("Platform Engineer I", "Build internal developer platform tooling.") == (
+        RoleFamily.backend
+    )
+
+
+def test_applied_scientist_classification():
+    assert _family("Applied Scientist, New Grad", "Research and ship ML models at scale.") == (
+        RoleFamily.ai
+    )
+
+
+def test_ai_description_cannot_promote_nontechnical_title():
+    """A description stuffed with AI/ML terms must not resurrect a
+    nontechnical title into a target role -- the title gate blocks scoring
+    the description entirely."""
+    assert _family(
+        "Marketing Coordinator",
+        "Support our AI-powered marketing platform using machine learning and LLMs.",
+    ) == RoleFamily.other
+
+
+def test_ambiguous_title_is_other_even_with_thin_description():
+    assert _family("Program Coordinator", "General office support.") == RoleFamily.other
+
+
 # --- resume recommendation ---
 def test_resume_ai_for_ai_role():
     roles = classify_role(make_job("ML Engineer", "Deep learning, PyTorch, inference at scale."))
