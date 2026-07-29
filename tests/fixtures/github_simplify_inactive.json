@@ -1,0 +1,49 @@
+[
+  {
+    "source": "Simplify",
+    "category": "Software Engineering",
+    "company_name": "Acme",
+    "id": "gh-cross-555",
+    "title": "Software Engineer, New Grad",
+    "active": true,
+    "date_updated": 1782000000,
+    "date_posted": 1782000000,
+    "url": "https://www.boards.greenhouse.io/acme/jobs/555/?utm_source=Simplify&ref=newgrad",
+    "locations": ["New York, NY"],
+    "company_url": "https://simplify.jobs/c/Acme",
+    "is_visible": true,
+    "sponsorship": "Offers Sponsorship",
+    "degrees": ["Bachelor's"]
+  },
+  {
+    "source": "Simplify",
+    "category": "Software Engineering",
+    "company_name": "OldCo",
+    "id": "gh-closed-1",
+    "title": "Backend Engineer, New Grad",
+    "active": false,
+    "date_updated": 1700000000,
+    "date_posted": 1700000000,
+    "url": "https://job-boards.greenhouse.io/oldco/jobs/1",
+    "locations": ["Remote"],
+    "company_url": "https://simplify.jobs/c/OldCo",
+    "is_visible": true,
+    "sponsorship": "Offers Sponsorship",
+    "degrees": []
+  },
+  {
+    "source": "Simplify",
+    "category": "Software Engineering",
+    "company_name": "NoActiveFieldCo",
+    "id": "gh-no-active-field",
+    "title": "Platform Engineer, New Grad",
+    "date_updated": 1782100000,
+    "date_posted": 1782100000,
+    "url": "https://job-boards.greenhouse.io/noactivefieldco/jobs/1",
+    "locations": ["Austin, TX"],
+    "company_url": "https://simplify.jobs/c/NoActiveFieldCo",
+    "is_visible": true,
+    "sponsorship": "Does Not Offer Sponsorship",
+    "degrees": []
+  }
+]

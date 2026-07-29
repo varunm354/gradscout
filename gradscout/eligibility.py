@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass, field
 
 from gradscout.models import CandidateProfile, EligibilityStatus, EmploymentType, Job
+from gradscout.roles import evaluate_title_gate
 from gradscout.textmatch import (
     PREFERRED_CUES,
     REQUIRED_CUES,
@@ -219,6 +220,36 @@ def evaluate_eligibility(
         return EligibilityAssessment(
             EligibilityStatus.ineligible, [reason], employment, new_grad,
             hard_ineligible=True, hard_reason=reason,
+        )
+
+    # 0) Title-first technical relevance gate (Phase 5.1; see gradscout.roles).
+    #    A job must show a credible target-role signal in its TITLE before it
+    #    can ever be eligible for a normal p1/p2/p3 alert. A strong
+    #    nontechnical title signal (compliance, policy, marketing, sales,
+    #    biological safety, fellowships, ...) is a HARD override -- exactly
+    #    like the other hard rules below, description keywords (e.g. an
+    #    incidental "AI"/"machine learning" mention) can never resurrect it
+    #    into a target role, and the optional LLM can never flip it back. A
+    #    title with neither a credible nor a nontechnical signal is
+    #    ambiguous and goes to review, not silently to a normal alert.
+    gate = evaluate_title_gate(job.title)
+    if gate.non_target:
+        reason = f"Nontechnical title signal: '{gate.matched_non_target}'"
+        if gate.matched_credible:
+            reason += (
+                f" (title also read as a target role via '{gate.matched_credible}', "
+                "but the nontechnical domain signal overrides it)"
+            )
+        return hard(reason)
+    if not gate.credible:
+        return EligibilityAssessment(
+            EligibilityStatus.review,
+            [
+                "Title has no credible target-role signal (e.g. software/backend/"
+                f"platform/site-reliability/ML/data engineer, applied scientist): "
+                f"'{job.title}'"
+            ],
+            employment, new_grad,
         )
 
     # 1) Seniority in title -> hard ineligible.

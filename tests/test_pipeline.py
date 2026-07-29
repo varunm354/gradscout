@@ -100,6 +100,17 @@ def _conn():
     return c
 
 
+def _conn_past_baseline():
+    """A connection for tests exercising ORDINARY (post-baseline) alert
+    routing, not baseline-bootstrap behavior itself (see tests/test_baseline.py
+    for that). Phase 5.2's baseline bootstrap only narrows alerting on a
+    fresh DB's very first successful run; pre-marking the baseline complete
+    here keeps these tests' original routing-only intent unaffected."""
+    c = _conn()
+    db.mark_baseline_complete(c, now=NOW - timedelta(days=1))
+    return c
+
+
 def _notifier(status_code=204, dry_run=False, calls: list | None = None) -> DiscordNotifier:
     calls = calls if calls is not None else []
 
@@ -116,7 +127,7 @@ def _notifier(status_code=204, dry_run=False, calls: list | None = None) -> Disc
 # individual alert + one review digest (not one message per review job).
 # --------------------------------------------------------------------------- #
 def test_full_run_classifies_persists_and_routes_alerts():
-    conn = _conn()
+    conn = _conn_past_baseline()
     config = _config()
     calls: list = []
     notifier = _notifier(calls=calls)
@@ -240,7 +251,7 @@ def test_discord_failure_leaves_alert_pending():
 # Dry-run: no Discord request at all, nothing ever marked sent.
 # --------------------------------------------------------------------------- #
 def test_dry_run_makes_no_discord_request_and_marks_nothing_sent():
-    conn = _conn()
+    conn = _conn_past_baseline()
     config = _config()
     calls: list = []
     notifier = _notifier(dry_run=True, calls=calls)
@@ -349,6 +360,60 @@ def test_runs_fully_deterministic_without_llm_agent():
     rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
     assert rec.llm_used is False
     assert rec.eligibility_status.value == "review"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5.1: title-first relevance gating end-to-end -- a mixed batch of
+# false-positive nontechnical titles (even with AI/ML-heavy descriptions),
+# legitimate credible titles, and one ambiguous title. Only the legitimate
+# titles should produce an individual (non-digest) alert; the false positives
+# must never be enqueued at all (hard-ineligible), and the ambiguous title
+# must land in the review digest, not a normal alert.
+# --------------------------------------------------------------------------- #
+def test_nontechnical_titles_never_generate_normal_alerts_end_to_end():
+    conn = _conn_past_baseline()
+    config = _config()
+    calls: list = []
+    notifier = _notifier(calls=calls)
+
+    ai_heavy_desc = (
+        "Leverage AI and machine learning, including LLMs and generative AI, "
+        "to power our platform. PyTorch and MLOps experience a plus."
+    )
+    rows = [
+        _row("Biological Safety Research Scientist", ai_heavy_desc, job_id="fp1"),
+        _row("AI Compliance Officer", ai_heavy_desc, job_id="fp2"),
+        _row("Data Scientist, Marketing", ai_heavy_desc, job_id="fp3"),
+        _row("Backend Engineer, New Grad", ELIGIBLE_DESC, job_id="legit1"),
+        _row("Machine Learning Engineer, New Grad", ELIGIBLE_DESC, job_id="legit2"),
+        _row("Program Coordinator", "General office support.", job_id="ambig1"),
+    ]
+    stats = run_once(conn, config, [_collector(rows)], None, notifier, now=NOW)
+
+    assert stats.jobs_seen == 6
+    # Only the 2 legitimate individual alerts + 1 review digest are enqueued;
+    # the 3 nontechnical false positives are hard-ineligible and never enqueued.
+    assert stats.alerts_enqueued == 3
+    assert stats.alerts_sent == 2  # the 2 individual legitimate alerts
+    assert stats.review_digest_sent is True
+
+    # Exactly 3 Discord messages: 2 individual alerts + 1 digest (never one
+    # per false-positive or per ambiguous job).
+    assert len(calls) == 3
+
+    for job_id in ("fp1", "fp2", "fp3"):
+        rec = db.get_job_by_canonical(conn, f"https://boards.greenhouse.io/acme/jobs/{job_id}")
+        assert rec.eligibility_status.value == "ineligible"
+        assert db.get_alert(conn, rec.job_id, AlertChannel.discord) is None  # never enqueued
+
+    for job_id in ("legit1", "legit2"):
+        rec = db.get_job_by_canonical(conn, f"https://boards.greenhouse.io/acme/jobs/{job_id}")
+        assert rec.eligibility_status.value == "eligible"
+        assert db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
+
+    ambig_rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/ambig1")
+    assert ambig_rec.eligibility_status.value == "review"
+    assert db.get_alert(conn, ambig_rec.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
 
 
 if __name__ == "__main__":

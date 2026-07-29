@@ -1,7 +1,8 @@
-"""Offline tests for scripts.state_save (Phase 5).
+"""Offline tests for scripts.state_save (Phase 5; gzip-compressed Phase 5.1).
 
 Every test injects a FakeGit responder -- no real `git` remote/network call
-and no real GitHub Actions run happens here.
+and no real GitHub Actions run happens here. Compression itself uses the
+real (fast, deterministic) gzip module -- no need to fake it.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from scripts import db_compression as dc
 from scripts import state_save as ss
 
 
@@ -67,7 +69,19 @@ def test_save_state_first_time_creates_orphan_commit_no_force(tmp_path):
     )
     result = ss.save_state(db, "origin", "state", prior_sha=None, git=git)
 
-    assert result == ss.SaveResult(changed=True, pushed=True, new_sha="commitsha1")
+    assert result.changed is True
+    assert result.pushed is True
+    assert result.new_sha == "commitsha1"
+    assert result.compressed_size_bytes is not None
+    assert result.compressed_size_bytes > 0
+
+    # The DB is compressed to a sibling .gz file before hashing -- the raw
+    # db is never hashed/pushed directly.
+    gz_path = tmp_path / "gradscout.db.gz"
+    assert gz_path.exists()
+    hash_object_calls = [c for c in git.calls if c["args"][0] == "hash-object"]
+    assert any(str(gz_path) in c["args"] for c in hash_object_calls)
+    assert not any(str(db) in c["args"] for c in hash_object_calls)
 
     commit_call = next(c for c in git.calls if c["args"][0] == "commit-tree")
     assert "-p" not in commit_call["args"]  # no parent: first-ever commit
@@ -78,17 +92,52 @@ def test_save_state_first_time_creates_orphan_commit_no_force(tmp_path):
     assert push_call["args"] == ["push", "origin", "commitsha1:refs/heads/state"]
     assert not any(a.startswith("--force-with-lease") for a in push_call["args"])
 
-    # mktree only accepts immediate children, so "data/gradscout.db" is built
-    # as a nested tree: one mktree call for the inner "data" tree (leaf blob
-    # named "gradscout.db"), one for the outer root tree (a "data" subtree
-    # entry plus the top-level README blob).
+    # mktree only accepts immediate children, so "data/gradscout.db.gz" is
+    # built as a nested tree: one mktree call for the inner "data" tree (leaf
+    # blob named "gradscout.db.gz"), one for the outer root tree (a "data"
+    # subtree entry plus the top-level README blob). No raw "gradscout.db"
+    # (without ".gz") is ever written to the tree.
     mktree_calls = [c for c in git.calls if c["args"][0] == "mktree"]
     assert len(mktree_calls) == 2
-    assert any("gradscout.db" in c["input"] and "data/" not in c["input"] for c in mktree_calls)
+    assert any(
+        "gradscout.db.gz" in c["input"] and "data/" not in c["input"] for c in mktree_calls
+    )
     assert any(
         "STATE_BRANCH_README.md" in c["input"] and "\tdata\n" in c["input"]
         for c in mktree_calls
     )
+    assert not any("\tgradscout.db\n" in c["input"] for c in mktree_calls)
+
+
+def test_save_state_compresses_to_gz_before_hashing(tmp_path):
+    """The blob that gets hashed/committed is the gzip-compressed content,
+    not the raw DB bytes."""
+    db = tmp_path / "gradscout.db"
+    db.write_bytes(b"raw-sqlite-content" * 100)
+    git = FakeGit(
+        {
+            "hash-object": _hash_object_split("dbsha1", "readmesha1"),
+            "mktree": FakeProc(0, stdout="treesha1\n"),
+            "commit-tree": FakeProc(0, stdout="commitsha1\n"),
+            "push": FakeProc(0),
+        }
+    )
+    ss.save_state(db, "origin", "state", prior_sha=None, git=git)
+
+    gz_path = tmp_path / "gradscout.db.gz"
+    assert gz_path.read_bytes() != db.read_bytes()
+    assert len(gz_path.read_bytes()) < len(db.read_bytes())
+
+
+def test_save_state_raises_clearly_when_compressed_state_exceeds_github_limit(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "gradscout.db"
+    db.write_bytes(b"content")
+    monkeypatch.setattr(dc, "GITHUB_MAX_FILE_BYTES", 1)  # anything real exceeds 1 byte
+
+    with pytest.raises(dc.StateTooLargeError, match="exceeds"):
+        ss.save_state(db, "origin", "state", prior_sha=None, git=FakeGit({}))
 
 
 def test_save_state_no_change_skips_commit_and_push(tmp_path):
@@ -102,7 +151,10 @@ def test_save_state_no_change_skips_commit_and_push(tmp_path):
     )
     result = ss.save_state(db, "origin", "state", prior_sha="priorsha", git=git)
 
-    assert result == ss.SaveResult(changed=False, pushed=False, new_sha="priorsha")
+    assert result.changed is False
+    assert result.pushed is False
+    assert result.new_sha == "priorsha"
+    assert result.compressed_size_bytes is not None  # still computed, for reporting
     assert not any(c["args"][0] in ("mktree", "commit-tree", "push") for c in git.calls)
 
 
@@ -120,7 +172,10 @@ def test_save_state_change_pushes_with_force_with_lease(tmp_path):
     )
     result = ss.save_state(db, "origin", "state", prior_sha="priorsha", git=git)
 
-    assert result == ss.SaveResult(changed=True, pushed=True, new_sha="commitsha2")
+    assert result.changed is True
+    assert result.pushed is True
+    assert result.new_sha == "commitsha2"
+    assert result.compressed_size_bytes is not None
 
     commit_call = next(c for c in git.calls if c["args"][0] == "commit-tree")
     assert "-p" in commit_call["args"]
@@ -180,7 +235,9 @@ def test_save_state_mktree_failure_raises(tmp_path):
 
 
 def test_main_prints_status(monkeypatch, capsys):
-    fake_result = ss.SaveResult(changed=True, pushed=True, new_sha="commitsha")
+    fake_result = ss.SaveResult(
+        changed=True, pushed=True, new_sha="commitsha", compressed_size_bytes=12345
+    )
     monkeypatch.setattr(ss, "save_state", lambda *a, **k: fake_result)
 
     rc = ss.main(["--db", "x.db", "--branch", "state", "--prior-sha", "priorsha"])
@@ -190,6 +247,7 @@ def test_main_prints_status(monkeypatch, capsys):
     assert "state changed: True" in out
     assert "state pushed: True" in out
     assert "commitsha" in out
+    assert "12,345 bytes" in out
 
 
 def test_main_empty_prior_sha_becomes_none(monkeypatch):

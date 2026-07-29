@@ -143,6 +143,21 @@ def test_github_missing_fields_is_partial(load_fixture):
     assert result.parse_errors == 2     # missing url + missing title
 
 
+def test_github_skips_active_false_rows(load_fixture):
+    """Simplify keeps closed postings in the feed permanently for historical
+    record (active: false); these must be skipped so runs don't re-collect
+    the entire historical/global feed as "new" every time. A row that omits
+    the "active" key entirely is still treated as active (some feeds omit
+    it)."""
+    c = GithubRepoCollector("SimplifyJobs-NewGrad", "http://x")
+    rows, errors = c.parse(load_fixture("github_simplify_inactive.json"))
+    assert errors == 0  # skipped, not a parse error
+    assert len(rows) == 2
+    companies = {r.company for r in rows}
+    assert companies == {"Acme", "NoActiveFieldCo"}
+    assert "OldCo" not in companies
+
+
 def test_github_unknown_parser_is_error():
     c = GithubRepoCollector("Repo", "http://x", parser="generic_md")
     c.fetch = lambda client=None: []

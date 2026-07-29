@@ -24,7 +24,14 @@ from gradscout import db
 from gradscout.analyze import apply_to_job, classify_job
 from gradscout.collectors.base import Collector, run_collector
 from gradscout.llm import JobAnalysisAgent
-from gradscout.models import AlertChannel, ChangeStatus, Config, EligibilityStatus, SourceStatus
+from gradscout.models import (
+    AlertChannel,
+    AlertPriority,
+    ChangeStatus,
+    Config,
+    EligibilityStatus,
+    SourceStatus,
+)
 from gradscout.normalize import normalize
 from gradscout.notify.discord import MAX_DIGEST_ITEMS, DiscordNotifier
 from gradscout.prioritize import meets_min_priority
@@ -50,6 +57,8 @@ class RunStats:
     source_failures_notified: int = 0
     source_recoveries_notified: int = 0
     daily_summary_sent: bool = False
+    baseline_run: bool = False
+    baseline_completed: bool = False
 
 
 def run_once(
@@ -64,6 +73,16 @@ def run_once(
 ) -> RunStats:
     now = now or datetime.now(timezone.utc)
     stats = RunStats()
+
+    # Baseline bootstrap (Phase 5.2): fixed for the whole run from the meta
+    # table's state as of BEFORE this run touches anything, so a fresh DB's
+    # very first successful run stores every job normally but never floods
+    # Discord with the entire historical backlog already open on first
+    # crawl. Only mark this run's is_baseline_run so subsequent runs (once
+    # the meta key is set at the very end, on success) go through the
+    # ordinary created/changed alerting rules untouched.
+    is_baseline_run = not db.is_baseline_complete(conn)
+    stats.baseline_run = is_baseline_run
 
     for collector in collectors:
         # Inspect the PRIOR source-health row before record_source_result()
@@ -111,9 +130,15 @@ def run_once(
                 continue
 
             stored = db.get_job(conn, upsert_result.job_id)
+            # During baseline, a freshly created row's first_seen_at is
+            # always "now", which would make every historical listing look
+            # artificially recent via the fallback below -- so baseline
+            # recency is judged strictly by the source's own posted_at
+            # timestamp (never fabricated; simply not recent if absent).
+            first_seen_basis = None if is_baseline_run else (stored.first_seen_at if stored else now)
             recent = is_recent(
                 stored.source_posted_at if stored else None,
-                stored.first_seen_at if stored else now,
+                first_seen_basis,
                 config.notifications.new_grad_recent_hours,
                 now,
             )
@@ -122,7 +147,9 @@ def run_once(
             db.apply_classification(conn, upsert_result.job_id, resolved)
             stats.jobs_classified += 1
 
-            if _enqueue_if_warranted(conn, upsert_result.job_id, resolved, config, now):
+            if _enqueue_if_warranted(
+                conn, upsert_result.job_id, resolved, config, now, is_baseline_run=is_baseline_run
+            ):
                 stats.alerts_enqueued += 1
 
     sent, pending = _send_job_alerts(conn, notifier, config)
@@ -130,6 +157,18 @@ def run_once(
     stats.alerts_pending += pending
     stats.review_digest_sent = _send_review_digest(conn, notifier, config)
     stats.daily_summary_sent = _maybe_send_daily_summary(conn, notifier, config, now)
+
+    # Mark the baseline complete only now that every step above (collect,
+    # normalize, classify, persist, enqueue, deliver) has run without
+    # raising -- an exception anywhere earlier in this function propagates
+    # out of run_once and this line is simply never reached, so a failed
+    # first run correctly leaves the next run in baseline mode too. A
+    # dry-run must still report what baseline mode *would* do (see
+    # is_baseline_run/enqueue behavior above) but must never durably mark
+    # the baseline complete, since no real delivery happened.
+    if is_baseline_run and not notifier.dry_run:
+        db.mark_baseline_complete(conn, now=now)
+        stats.baseline_completed = True
 
     logger.info(
         "pipeline run complete",
@@ -147,6 +186,8 @@ def run_once(
                 "alerts_pending": stats.alerts_pending,
                 "review_digest_sent": stats.review_digest_sent,
                 "daily_summary_sent": stats.daily_summary_sent,
+                "baseline_run": stats.baseline_run,
+                "baseline_completed": stats.baseline_completed,
             }
         },
     )
@@ -173,10 +214,34 @@ def _notify_source_transition(notifier: DiscordNotifier, prev_health, result) ->
     return None
 
 
-def _enqueue_if_warranted(conn, job_id: int, resolved, config: Config, now: datetime) -> bool:
+def _enqueue_if_warranted(
+    conn, job_id: int, resolved, config: Config, now: datetime, *, is_baseline_run: bool = False
+) -> bool:
     """Only enqueue for a job that's newly created or materially changed in a
     way relevant to eligibility/role/priority/resume/requirements -- which is
-    guaranteed by the caller only reaching here for created/changed jobs."""
+    guaranteed by the caller only reaching here for created/changed jobs.
+
+    During baseline bootstrap (a fresh DB's very first successful run), every
+    job is still classified and stored normally, but the ordinary alerting
+    rules are replaced with a much narrower one: only a genuinely-recent P1
+    job (source-provided posted_at within new_grad_recent_hours -- see the
+    tightened recency computation in run_once) is ever enqueued. Review
+    items never enter the digest backlog during baseline, and ordinary
+    historical P2/P3-eligible jobs are stored but never alerted -- this is
+    what stops a fresh first run from flooding Discord with thousands of
+    already-open historical listings.
+    """
+    if is_baseline_run:
+        if (
+            resolved.eligibility_status == EligibilityStatus.eligible
+            and resolved.alert_priority == AlertPriority.p1
+            and meets_min_priority(resolved.alert_priority, config.notifications.discord_min_priority)
+        ):
+            return db.enqueue_alert(
+                conn, job_id, AlertChannel.discord, resolved.alert_priority.value, now=now
+            )
+        return False
+
     if resolved.eligibility_status == EligibilityStatus.review:
         if not config.notifications.send_review_digest:
             return False

@@ -45,6 +45,13 @@ class GithubRepoCollector(Collector):
         errors = 0
         for row in payload:
             try:
+                if row.get("active") is False:
+                    # Simplify keeps closed postings in the feed permanently
+                    # for historical record; skipping them (rather than just
+                    # relying on downstream dedup) stops every run from
+                    # re-collecting the entire historical/global feed as
+                    # "new" for any listing GradScout hasn't seen yet.
+                    continue
                 company = row["company_name"]
                 title = row["title"]
                 apply_url = row["url"]

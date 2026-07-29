@@ -480,6 +480,26 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Baseline bootstrap (Phase 5.2): a fresh DB's very first successful run
+# stores every job normally but suppresses the ordinary historical alert
+# flood -- see gradscout.pipeline.run_once. Presence of this meta key is the
+# durable, cross-run signal that the baseline has been completed at least
+# once; absence means the next run must run in baseline mode again (e.g.
+# because the prior attempt failed or was a dry-run).
+# --------------------------------------------------------------------------- #
+BASELINE_COMPLETE_META_KEY = "baseline_completed_at"
+
+
+def is_baseline_complete(conn: sqlite3.Connection) -> bool:
+    return get_meta(conn, BASELINE_COMPLETE_META_KEY) is not None
+
+
+def mark_baseline_complete(conn: sqlite3.Connection, now: datetime | None = None) -> None:
+    now = now or _utcnow()
+    set_meta(conn, BASELINE_COMPLETE_META_KEY, now.isoformat())
+
+
+# --------------------------------------------------------------------------- #
 # Alerts (pending -> sent)
 # --------------------------------------------------------------------------- #
 def enqueue_alert(

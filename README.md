@@ -70,6 +70,15 @@ boards, GitHub repos, keyword filters, notification thresholds). Secrets are env
    control discovery, delete records, fabricate source fields, or bypass validation.
 7. **Never fabricate.** Posting dates come only from the source; we distinguish
    `source_posted_at` from `first_seen_at` and never claim "posted recently" without evidence.
+8. **Title-first relevance gating (Phase 5.1).** A job must show a credible target-role
+   signal in its TITLE (e.g. software/backend/platform/site-reliability engineer, ML/AI
+   engineer, applied scientist, data engineer, product engineer) before it can be
+   classified as a relevant role family or receive a normal P1/P2/P3 alert. Description
+   keywords may only refine which target family a credible title belongs to -- they can
+   never independently promote a nontechnical title (compliance, policy, marketing,
+   partnerships, sales, biological safety, fellowships, economics, ...) into one, no
+   matter how many AI/ML terms appear in the body text. Titles with neither a credible nor
+   a nontechnical signal are ambiguous and go to the review digest, never a normal alert.
 
 ## State persistence (GitHub Actions)
 
@@ -84,10 +93,22 @@ never committed to `main`). Each hourly run (`.github/workflows/gradscout-monito
    `--force-with-lease` so a concurrent run's newer state is never overwritten.
 
 The orphan `state` branch shares no history with `main` and, by construction, can only
-ever contain `data/gradscout.db` and a tiny machine-managed README -- never application
+ever contain `data/gradscout.db.gz` and a tiny machine-managed README -- never application
 code. `workflow_dispatch` supports a manual `dry_run` input; the hourly schedule fires at
 minute 17 (not top-of-hour). See `docs/PHASE_5_HANDOFF.md` for full setup, secrets,
 permissions, troubleshooting, and how to disable the schedule.
+
+**Compressed state (Phase 5.1).** GitHub rejects any single pushed file over 100 MB; the
+first production database (~135.7 MB raw) exceeded that, so `data/gradscout.db` is
+deterministically gzip-compressed (`scripts/db_compression.py`) to `data/gradscout.db.gz`
+before being committed to `state`, and decompressed back to `data/gradscout.db` on
+restore. Compression is checkpointed/closed first (`PRAGMA wal_checkpoint`) and uses a
+fixed `mtime=0` so re-compressing unchanged content always yields a byte-identical `.gz`
+(needed for `state_save.py`'s no-op detection). If the compressed file would still exceed
+100 MB, the save fails loudly with a clear error rather than attempting (and having
+GitHub reject) the push. `state_restore.py` reads the compressed path first and falls
+back to a legacy raw `data/gradscout.db` path for backward compatibility with state saved
+before this change.
 
 ## Status
 

@@ -314,7 +314,100 @@ manual commands are documented for optional reference only and were not executed
 - Disabling the schedule never touches the `state` branch -- the last known-good
   `data/gradscout.db` remains exactly as it was.
 
-## 14. Deferred features (Phase 6+)
+## 14. Phase 5.1 — first production run fixes
+
+The first real GitHub Actions run (schedule + one manual real run) surfaced two
+production issues, both fixed in this chat. **No commits/pushes were made for
+this phase either** -- see the top-level chat summary for exact verification
+results.
+
+### 14.1 Durable state exceeded GitHub's 100 MB file limit
+
+The first production `data/gradscout.db` was ~135.7 MB. GitHub hard-rejects any
+single pushed file over 100 MB, so `scripts/state_save.py`'s push to `state`
+was rejected every run; since state never actually persisted, every run
+restarted from empty and re-alerted everything it had already alerted.
+
+Fix -- compressed state:
+- New `scripts/db_compression.py`: `checkpoint_and_close()` (best-effort
+  `PRAGMA wal_checkpoint(TRUNCATE)` + commit + close before touching the file
+  at all, so compression always reads a consistent, non-open file), and
+  deterministic `compress_db()`/`decompress_db()` (`gzip` with a fixed
+  `mtime=0` and fixed compression level, so re-compressing byte-identical
+  input always produces a byte-identical `.gz` -- required for
+  `state_save.py`'s existing blob-SHA no-op detection to keep working on the
+  compressed artifact).
+- `scripts/state_save.py` now compresses `data/gradscout.db` to a sibling
+  `data/gradscout.db.gz` before hashing, and that `.gz` path is the **only**
+  DB path ever written into the tree (`STATE_BRANCH_README.md` +
+  `data/gradscout.db.gz`, nothing else) -- an older commit's legacy raw
+  `data/gradscout.db` entry is therefore dropped automatically on the very
+  next save. If the compressed size would still exceed 100 MB,
+  `ensure_within_github_limit()` raises a clear `StateTooLargeError` *before*
+  ever attempting the push.
+- `scripts/state_restore.py` tries `data/gradscout.db.gz` first (decompressing
+  it back to `data/gradscout.db`), and falls back to reading a legacy raw
+  `data/gradscout.db` path verbatim if the compressed path doesn't exist at
+  the fetched tip -- so any branch history written before this change still
+  restores correctly.
+- No workflow YAML changes were needed: both scripts still take
+  `--db data/gradscout.db` and handle the `.gz` sibling internally.
+- A realistic generated-SQLite test (`tests/test_db_compression.py`) builds a
+  real ~8 MB gradscout DB (5,000 synthetic job rows) and confirms it
+  compresses to well under 1 MB (a ~92% reduction) -- consistent with a
+  135.7 MB production DB compressing to comfortably under the 100 MB limit.
+
+### 14.2 Nontechnical roles generating normal Discord alerts
+
+The very first run also produced normal alerts for confidently nontechnical
+roles (Biological Safety Research Scientist, AI Compliance Officer, Data
+Scientist/Marketing, policy/fellowship programs, partnerships/business-facing
+roles) because `gradscout/roles.py`'s keyword scoring ran over
+`title + description` with no title gate -- any AI/ML mention in the body text
+could make a nontechnical job score as a target role family. Worse,
+`gradscout/prioritize.py`'s `score_role_priority`/`score_alert_priority` fell
+back to `role_priority=3` / `alert_priority=p3` for ANY otherwise-eligible job
+regardless of role relevance, and `p3` met `config.yaml`'s
+`discord_min_priority: p3` -- so these got enqueued as individual normal
+alerts, not just the review digest. This combined with the Simplify feed's
+full historical/global listing (every company, not just the watchlist, and
+including closed listings that the collector never filtered by `active`) to
+produce the ~17,000-pending-alert backlog on the first run.
+
+Fix -- title-first technical relevance gating (see `README.md` key design
+decision #8 for the user-facing summary):
+- `gradscout/roles.py` gained `evaluate_title_gate()`, checked against the
+  TITLE only: a small `CREDIBLE_TITLE_FAMILY` phrase list (software/backend/
+  platform/infrastructure/site-reliability/full-stack engineer, ML/AI
+  engineer, applied/research scientist, data engineer, analytics engineer,
+  data scientist, product engineer) and a `NON_TARGET_TITLE_TOKENS` list
+  (compliance, policy, biological safety, marketing, partnerships, sales,
+  account executive, fellowship(s), economics). A non-target hit always
+  overrides a credible hit in the same title (e.g. "Data Scientist,
+  Marketing"). `classify_role()` now returns `RoleFamily.other` immediately
+  -- never scoring the description at all -- unless the title clears this
+  gate, which is what stops description AI/ML mentions from resurrecting a
+  nontechnical title.
+- `gradscout/eligibility.py` gained a step-0 check using the same gate: a
+  non-target title is now a **hard** ineligible rule (same class as the
+  existing seniority/degree/experience hard rules -- never overridable by the
+  optional LLM); a title with neither a credible nor non-target signal
+  (ambiguous) becomes a **soft** `review` (consistent with how other
+  ambiguous cases already resolve elsewhere in that function). Because both
+  `classify_role` and `evaluate_eligibility` gate on the identical title
+  check, `eligible => relevant=True` is now an invariant, so the old
+  `p3`-fallback bug for `eligible`-but-irrelevant jobs is structurally
+  unreachable -- `gradscout/prioritize.py` needed no change.
+- `gradscout/collectors/github_repo.py` now skips Simplify feed rows marked
+  `"active": false` (closed listings kept in the feed for historical record),
+  directly reducing how much of the historical/global feed gets re-collected
+  as "new" every run.
+- Full regression coverage added in `tests/test_title_gate.py` (every named
+  false-positive example plus every legitimate credible-family title) and
+  extensions to `tests/test_roles_resume.py`, `tests/test_collectors.py`, and
+  `tests/test_pipeline.py`.
+
+## 15. Deferred features (Phase 6+)
 
 Unchanged from Phase 4's deferred list (24-hour repeat reminder, richer Discord
 formatting, non-Simplify GitHub parsers, Workday/iCIMS/other ATS, direct scraping,
