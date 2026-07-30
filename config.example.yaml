@@ -7,6 +7,16 @@ candidate:
   degree_level: bachelor            # informs deterministic eligibility rules
   role_families: [backend, ai, data, product]
   resume_variants: [backend, ai, data]
+  # --- Location preference (Phase 5.2) ---
+  # Recognized Bay Area / Northern California forms (case-insensitive substring
+  # match against a job's location text). Editable without any code change.
+  preferred_locations:
+    [San Francisco, San Jose, Santa Clara, Sunnyvale, Mountain View, Palo Alto,
+     Redwood City, Menlo Park, Cupertino, Oakland, Berkeley, Fremont, Pleasanton,
+     San Mateo, South San Francisco, Bay Area, Silicon Valley, Northern California, NorCal]
+  allow_us_remote: true              # a clearly U.S.-remote job is acceptable anywhere in the U.S.
+  location_required_for_alert: true  # gate normal alerts on location fit (never on eligibility)
+  remote_alert_priority_penalty: 1   # priority ranks to downgrade a remote_acceptable job by
 
 # High-priority companies. company_priority: 1 = highest.
 # coverage_status is DERIVED at runtime (not set here):

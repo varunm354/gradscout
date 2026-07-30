@@ -14,6 +14,7 @@ from gradscout.models import (
     EligibilityStatus,
     EmploymentType,
     JobRecord,
+    LocationClassification,
     ResumeConfidence,
     ResumeVariant,
     RoleFamily,
@@ -46,6 +47,8 @@ def make_record(**overrides) -> JobRecord:
         resume_reason="Matched backend keywords",
         alert_priority=AlertPriority.p1,
         llm_used=False,
+        location_classification=LocationClassification.preferred,
+        location_reason="test fixture default",
         sources=[],
     )
     base.update(overrides)
@@ -149,6 +152,17 @@ def test_job_alert_embed_contains_required_fields():
     assert by_name["Posted"] != by_name["First discovered by GradScout"]
 
 
+def test_job_alert_embed_shows_location_fit():
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    notifier.send_job_alert(make_record(location_classification=LocationClassification.remote_acceptable))
+
+    embed = json.loads(calls[0].content)["embeds"][0]
+    by_name = {f["name"]: f["value"] for f in embed["fields"]}
+    assert by_name["Location fit"] == "US Remote"
+
+
 def test_job_alert_omits_posted_field_when_source_posted_at_missing():
     handler, calls = _capturing()
     client = _client_with(handler)
@@ -174,6 +188,24 @@ def test_review_digest_batches_all_jobs_into_one_message():
 
     embed = json.loads(calls[0].content)["embeds"][0]
     assert len(embed["fields"]) == 3
+
+
+def test_review_digest_notes_out_of_region_and_unclear_but_not_preferred():
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    jobs = [
+        make_record(job_id=1, title="Preferred Job", location_classification=LocationClassification.preferred),
+        make_record(job_id=2, title="OOR Job", location_classification=LocationClassification.out_of_region),
+        make_record(job_id=3, title="Unclear Job", location_classification=LocationClassification.unclear),
+    ]
+    notifier.send_review_digest(jobs)
+
+    embed = json.loads(calls[0].content)["embeds"][0]
+    values = {f["name"]: f["value"] for f in embed["fields"]}
+    assert "Location:" not in values["Acme — Preferred Job"]
+    assert "Location: Out of region" in values["Acme — OOR Job"]
+    assert "Location: Location unclear" in values["Acme — Unclear Job"]
 
 
 def test_empty_review_digest_sends_nothing():

@@ -7,7 +7,15 @@ big-tech behavior is data, not hardcoded. Lower number = higher priority.
 from __future__ import annotations
 
 from gradscout.eligibility import EligibilityAssessment
-from gradscout.models import AlertPriority, Config, EligibilityStatus, EmploymentType, Job, ResumeConfidence
+from gradscout.models import (
+    AlertPriority,
+    Config,
+    EligibilityStatus,
+    EmploymentType,
+    Job,
+    LocationClassification,
+    ResumeConfidence,
+)
 from gradscout.textmatch import normalize
 
 
@@ -67,6 +75,26 @@ def meets_min_priority(priority: AlertPriority, threshold: AlertPriority) -> boo
     """True if ``priority`` is at least as urgent as ``threshold`` (e.g. p1/p2
     both meet a p2 threshold; p3 does not)."""
     return _ALERT_PRIORITY_RANK[priority] <= _ALERT_PRIORITY_RANK[threshold]
+
+
+# Only p1/p2/p3 are ever downgraded by the location penalty (review/ineligible/
+# unclassified are untouched -- they're not urgency tiers).
+_DOWNGRADABLE_ORDER = [AlertPriority.p1, AlertPriority.p2, AlertPriority.p3]
+
+
+def apply_location_penalty(
+    priority: AlertPriority, classification: LocationClassification, penalty: int
+) -> AlertPriority:
+    """Downgrade ``priority`` by ``penalty`` ranks (capped at p3) when the job is only
+    ``remote_acceptable`` (a weaker match than an onsite/hybrid Bay Area role). No-op
+    for any other classification, a non-positive penalty, or a non p1/p2/p3 priority."""
+    if classification != LocationClassification.remote_acceptable or penalty <= 0:
+        return priority
+    if priority not in _DOWNGRADABLE_ORDER:
+        return priority
+    idx = _DOWNGRADABLE_ORDER.index(priority)
+    new_idx = min(idx + penalty, len(_DOWNGRADABLE_ORDER) - 1)
+    return _DOWNGRADABLE_ORDER[new_idx]
 
 
 def score_alert_priority(

@@ -104,6 +104,20 @@ class ChangeStatus(str, Enum):
     unchanged = "unchanged"
 
 
+class LocationClassification(str, Enum):
+    """Phase 5.2: deterministic Bay Area / Northern California location fit.
+
+    Computed independently of eligibility (never affects it) and used only to
+    gate/penalize alerting -- see gradscout.location. A job is always stored
+    regardless of its classification.
+    """
+
+    preferred = "preferred"              # Bay Area / Northern California onsite or hybrid
+    remote_acceptable = "remote_acceptable"  # clearly U.S.-remote, no conflicting required region
+    out_of_region = "out_of_region"      # clearly located/required outside Northern California
+    unclear = "unclear"                  # cannot be determined safely
+
+
 # --------------------------------------------------------------------------- #
 # Job models
 # --------------------------------------------------------------------------- #
@@ -169,6 +183,10 @@ class Job(BaseModel):
     llm_used: bool = False
     raw_blob: dict = Field(default_factory=dict)
 
+    # --- location fit (Phase 5.2; never affects eligibility) ---
+    location_classification: LocationClassification = LocationClassification.unclear
+    location_reason: str | None = None
+
     @field_validator("company_priority", "role_priority")
     @classmethod
     def _positive(cls, v: int) -> int:
@@ -204,6 +222,8 @@ class JobRecord(BaseModel):
     resume_reason: str | None
     alert_priority: AlertPriority
     llm_used: bool
+    location_classification: LocationClassification
+    location_reason: str | None
     sources: list[JobSourceRecord] = Field(default_factory=list)
 
 
@@ -224,6 +244,29 @@ class CandidateProfile(BaseModel):
     degree_level: str = "bachelor"
     role_families: list[str] = Field(default_factory=lambda: ["backend", "ai", "data", "product"])
     resume_variants: list[str] = Field(default_factory=lambda: ["backend", "ai", "data"])
+
+    # --- location preference (Phase 5.2) ---
+    # Recognized Bay Area / Northern California forms. Matched as case-insensitive,
+    # word-boundary substrings against a job's location text (see gradscout.location) --
+    # editable here without any code change.
+    preferred_locations: list[str] = Field(
+        default_factory=lambda: [
+            "San Francisco", "San Jose", "Santa Clara", "Sunnyvale", "Mountain View",
+            "Palo Alto", "Redwood City", "Menlo Park", "Cupertino", "Oakland", "Berkeley",
+            "Fremont", "Pleasanton", "San Mateo", "South San Francisco", "Bay Area",
+            "Silicon Valley", "Northern California", "NorCal",
+        ]
+    )
+    # Whether a clearly U.S.-remote job (anywhere in the U.S.) is acceptable, since the
+    # candidate can work remotely from the Bay Area.
+    allow_us_remote: bool = True
+    # Whether location fit gates normal individual alerts at all. When False, location is
+    # still classified and stored/shown, but never blocks or penalizes an alert (legacy
+    # behavior).
+    location_required_for_alert: bool = True
+    # Alert-priority ranks (p1->p2->p3) to downgrade a remote_acceptable job by, since it
+    # is a weaker match than an onsite/hybrid Bay Area role.
+    remote_alert_priority_penalty: int = 1
 
 
 class GreenhouseSource(BaseModel):
@@ -323,6 +366,8 @@ class ResolvedAnalysis(BaseModel):
     deterministic_disagreement: bool = False
     disagreement_reason: str | None = None
     requires_human_review: bool = False
+    location_classification: LocationClassification = LocationClassification.unclear
+    location_reason: str | None = None
 
 
 # Resolve forward references for models that reference later-declared classes.
