@@ -429,5 +429,191 @@ def test_nontechnical_titles_never_generate_normal_alerts_end_to_end():
     assert db.get_alert(conn, ambig_rec.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
 
 
+# --------------------------------------------------------------------------- #
+# Phase 5.3 postmortem fix: production reported alerts_enqueued=6,
+# alerts_sent=0, alerts_pending=0 after a Discord 400 on a review digest --
+# investigate whether that was a stats bug or real alert loss, and prove the
+# no-lost-alerts invariant holds through the full pipeline end to end.
+# --------------------------------------------------------------------------- #
+def _review_job_id(i: int, *, long: bool) -> str:
+    # A long, unique job id (reflected verbatim into apply_url) is what
+    # actually inflates a review-digest FIELD's value -- title/description
+    # stay exactly REVIEW_TITLE/REVIEW_DESC (unaffected) so classification
+    # reliably still resolves to Eligibility Review either way.
+    return f"{i}" + ("u" * 700) if long else str(i)
+
+
+def _review_apply_url(i: int, *, long: bool = True) -> str:
+    return f"https://boards.greenhouse.io/acme/jobs/{_review_job_id(i, long=long)}"
+
+
+def _review_row(i: int, *, long: bool = True) -> RawJob:
+    """A row that classifies as Eligibility Review (same title/experience-
+    ambiguity signal as REVIEW_TITLE/REVIEW_DESC that existing tests in this
+    file already rely on), with a long company name + long job id (reflected
+    into apply_url) so 6 of these reproduce the exact production
+    review-digest payload-size failure once each is stored as a JobRecord --
+    each contributes exactly MAX_FIELD_NAME_LEN + MAX_FIELD_VALUE_LEN
+    characters to the digest embed, verified empirically to require 2
+    Discord messages for 6 of them and fit in 1 for 5."""
+    job_id = _review_job_id(i, long=long)
+    company = "Company " + ("C" * 250) if long else "Acme"
+    return _row(REVIEW_TITLE, REVIEW_DESC, job_id=job_id, company=company)
+
+
+def test_review_digest_failure_leaves_all_six_alerts_pending_not_lost():
+    """Reproduces the production incident: 6 long review-eligible jobs whose
+    digest would (pre-fix) have been rejected by Discord for exceeding the
+    6000-char aggregate limit. With a notifier that rejects every send (worst
+    case), confirms: no alert is ever marked sent, every alert is still
+    genuinely pending in the DB, alerts_pending reflects that truthfully, and
+    notification_delivery_failures makes the partial failure explicit in the
+    run's own stats -- i.e. this is provably NOT alert loss."""
+    conn = _conn_past_baseline()
+    config = _config()
+    rows = [_review_row(i) for i in range(6)]
+    notifier = _notifier(status_code=400)  # simulate the production Discord 400
+
+    stats = run_once(conn, config, [_collector(rows)], None, notifier, now=NOW)
+
+    assert stats.alerts_enqueued == 6
+    assert stats.alerts_sent == 0
+    # THE FIX: alerts_pending is a ground-truth DB query, so it correctly
+    # shows all 6 review alerts are still pending -- never the misleading 0
+    # that production reported.
+    assert stats.alerts_pending == 6
+    assert stats.review_digest_sent is False
+    assert stats.review_digest_chunks_sent == 0
+    assert stats.review_digest_chunks_failed >= 1
+    assert stats.notification_delivery_failures >= 1
+
+    pending = db.get_pending_alerts(conn, AlertChannel.discord)
+    assert len(pending) == 6
+    for i in range(6):
+        rec = db.get_job_by_canonical(conn, _review_apply_url(i))
+        alert = db.get_alert(conn, rec.job_id, AlertChannel.discord)
+        assert alert["state"] == AlertState.pending.value  # never lost, never falsely marked sent
+        assert alert["sent_at"] is None
+
+
+def test_review_digest_partial_chunk_failure_marks_only_delivered_chunk_sent():
+    """6 long review jobs split into 2 digest chunks; the first chunk's HTTP
+    request succeeds and the second fails. Only the jobs in the successful
+    chunk are marked sent; the rest remain pending, and alerts_pending/
+    notification_delivery_failures reflect the partial failure accurately."""
+    conn = _conn_past_baseline()
+    config = _config()
+    rows = [_review_row(i) for i in range(6)]
+
+    statuses = iter([204, 400])
+    calls: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(next(statuses))
+
+    notifier = DiscordNotifier(
+        webhook_url="https://discord.test/hook",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    stats = run_once(conn, config, [_collector(rows)], None, notifier, now=NOW)
+
+    assert stats.alerts_enqueued == 6
+    assert len(calls) == 2  # exactly 2 chunked digest messages, never one oversized message
+    assert stats.review_digest_chunks_sent == 1
+    assert stats.review_digest_chunks_failed == 1
+    assert stats.review_digest_sent is False  # NOT fully sent -- one chunk failed
+    assert stats.notification_delivery_failures == 1
+
+    pending = db.get_pending_alerts(conn, AlertChannel.discord)
+    sent_job_ids = set()
+    for i in range(6):
+        rec = db.get_job_by_canonical(conn, _review_apply_url(i))
+        alert = db.get_alert(conn, rec.job_id, AlertChannel.discord)
+        if alert["state"] == AlertState.sent.value:
+            sent_job_ids.add(i)
+    # Exactly the delivered chunk's jobs are sent; the rest are pending.
+    assert len(sent_job_ids) == 5
+    assert len(pending) == 1
+    # Ground-truth pending count matches the DB exactly.
+    assert stats.alerts_pending == len(pending)
+
+
+def test_successful_review_digest_marks_alert_sent_exactly_once():
+    conn = _conn_past_baseline()
+    config = _config()
+    row = _review_row(1, long=False)
+    calls: list = []
+    notifier = _notifier(calls=calls)
+
+    stats = run_once(conn, config, [_collector([row])], None, notifier, now=NOW)
+    assert stats.review_digest_sent is True
+    assert stats.notification_delivery_failures == 0
+
+    rec = db.get_job_by_canonical(conn, _review_apply_url(1, long=False))
+    alert = db.get_alert(conn, rec.job_id, AlertChannel.discord)
+    assert alert["state"] == AlertState.sent.value
+    first_sent_at = alert["sent_at"]
+
+    # A second run must never re-send or re-mark an already-sent alert.
+    later = NOW + timedelta(hours=1)
+    stats2 = run_once(conn, config, [_collector([])], None, notifier, now=later)
+    assert stats2.alerts_sent == 0
+    assert stats2.review_digest_sent is False  # nothing left pending to digest
+    alert_again = db.get_alert(conn, rec.job_id, AlertChannel.discord)
+    assert alert_again["sent_at"] == first_sent_at  # unchanged: marked sent exactly once
+    assert len(calls) == 1  # still just the one original digest message
+
+
+def test_dry_run_review_digest_performs_no_http_calls_and_changes_no_sent_state():
+    conn = _conn_past_baseline()
+    config = _config()
+    rows = [_review_row(i) for i in range(6)]
+    calls: list = []
+    notifier = _notifier(dry_run=True, calls=calls)
+
+    stats = run_once(conn, config, [_collector(rows)], None, notifier, now=NOW)
+
+    assert calls == []  # dry-run makes no HTTP calls at all
+    assert stats.alerts_enqueued == 6
+    assert stats.alerts_sent == 0
+    assert stats.review_digest_sent is False
+    assert stats.review_digest_chunks_sent == 0
+    assert stats.review_digest_chunks_failed == 0  # dry-run is a deliberate skip, never a failure
+    assert stats.notification_delivery_failures == 0
+    assert stats.alerts_pending == 6
+
+    pending = db.get_pending_alerts(conn, AlertChannel.discord)
+    assert len(pending) == 6
+    for row in pending:
+        rec = db.get_job_by_canonical(conn, row["apply_url"])
+        alert = db.get_alert(conn, rec.job_id, AlertChannel.discord)
+        assert alert["state"] == AlertState.pending.value
+        assert alert["sent_at"] is None
+
+
+def test_notification_delivery_failures_visible_alongside_individual_alert_failure():
+    """A mixed run (one individual alert succeeds to send, the review digest
+    fails) must surface the partial failure explicitly via
+    notification_delivery_failures, never silently as an all-zero, fully
+    healthy-looking run."""
+    conn = _conn_past_baseline()
+    config = _config()
+    rows = [
+        _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="ok1"),
+        *[_review_row(i) for i in range(6)],
+    ]
+    notifier = _notifier(status_code=400)  # everything this run is rejected
+
+    stats = run_once(conn, config, [_collector(rows)], None, notifier, now=NOW)
+
+    assert stats.alerts_enqueued == 7
+    assert stats.alerts_sent == 0
+    assert stats.notification_delivery_failures >= 2  # the individual alert AND >=1 digest chunk
+    assert stats.alerts_pending == len(db.get_pending_alerts(conn, AlertChannel.discord))
+    assert stats.alerts_pending == 7
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

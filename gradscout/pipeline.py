@@ -53,13 +53,29 @@ class RunStats:
     jobs_classified: int = 0
     alerts_enqueued: int = 0
     alerts_sent: int = 0
+    # Ground-truth count of every still-pending Discord alert (individual
+    # p1/p2/p3 AND review-digest priority) queried from the DB after every
+    # send attempt this run -- see the Phase 5.3 postmortem note on run_once
+    # for why this must never be a derived/arithmetic estimate.
     alerts_pending: int = 0
     review_digest_sent: bool = False
+    # Phase 5.3: the review digest may be split across multiple Discord
+    # messages (see gradscout.notify.discord._chunk_digest_jobs); these two
+    # give per-chunk visibility that a single review_digest_sent bool cannot.
+    review_digest_chunks_sent: int = 0
+    review_digest_chunks_failed: int = 0
     source_failures_notified: int = 0
     source_recoveries_notified: int = 0
     daily_summary_sent: bool = False
     baseline_run: bool = False
     baseline_completed: bool = False
+    # Phase 5.3 postmortem fix: an explicit count of every Discord request this
+    # run that was actually attempted (webhook configured, not dry-run) and
+    # did NOT receive a 2xx -- covers individual alerts, review-digest chunks,
+    # source failure/recovery, and the daily summary. A GitHub Actions run
+    # must never look fully healthy while this is nonzero; see run_once's
+    # final logging below.
+    notification_delivery_failures: int = 0
 
 
 def run_once(
@@ -98,11 +114,13 @@ def run_once(
         else:
             stats.sources_error += 1
 
-        transition = _notify_source_transition(notifier, prev_health, result)
+        transition, transition_delivered = _notify_source_transition(notifier, prev_health, result)
         if transition == "failed":
             stats.source_failures_notified += 1
         elif transition == "recovered":
             stats.source_recoveries_notified += 1
+        if transition is not None and not transition_delivered and _is_real_attempt(notifier):
+            stats.notification_delivery_failures += 1
 
         db.record_source_result(
             conn,
@@ -153,11 +171,29 @@ def run_once(
             ):
                 stats.alerts_enqueued += 1
 
-    sent, pending = _send_job_alerts(conn, notifier, config)
+    sent, individual_failed = _send_job_alerts(conn, notifier, config)
     stats.alerts_sent += sent
-    stats.alerts_pending += pending
-    stats.review_digest_sent = _send_review_digest(conn, notifier, config)
-    stats.daily_summary_sent = _maybe_send_daily_summary(conn, notifier, config, now)
+    stats.notification_delivery_failures += individual_failed
+
+    digest_sent, digest_chunks_sent, digest_chunks_failed = _send_review_digest(
+        conn, notifier, config
+    )
+    stats.review_digest_sent = digest_sent
+    stats.review_digest_chunks_sent = digest_chunks_sent
+    stats.review_digest_chunks_failed = digest_chunks_failed
+    stats.notification_delivery_failures += digest_chunks_failed
+
+    daily_summary_sent, daily_summary_failed = _maybe_send_daily_summary(conn, notifier, config, now)
+    stats.daily_summary_sent = daily_summary_sent
+    stats.notification_delivery_failures += int(daily_summary_failed)
+
+    # Phase 5.3 postmortem fix: query the DB directly for the ground truth
+    # rather than deriving this arithmetically from only the individual-alert
+    # counts above -- the original production bug was exactly this: a
+    # derived alerts_pending that silently excluded review-priority alerts
+    # left pending by a failed digest chunk, making a real partial-delivery
+    # failure look like a fully clean, empty run.
+    stats.alerts_pending = len(db.get_pending_alerts(conn, AlertChannel.discord))
 
     # Mark the baseline complete only now that every step above (collect,
     # normalize, classify, persist, enqueue, deliver) has run without
@@ -186,33 +222,62 @@ def run_once(
                 "alerts_sent": stats.alerts_sent,
                 "alerts_pending": stats.alerts_pending,
                 "review_digest_sent": stats.review_digest_sent,
+                "review_digest_chunks_sent": stats.review_digest_chunks_sent,
+                "review_digest_chunks_failed": stats.review_digest_chunks_failed,
                 "daily_summary_sent": stats.daily_summary_sent,
                 "baseline_run": stats.baseline_run,
                 "baseline_completed": stats.baseline_completed,
+                "notification_delivery_failures": stats.notification_delivery_failures,
             }
         },
     )
+    if stats.notification_delivery_failures:
+        # A GitHub Actions run must never look fully healthy from the
+        # standard "pipeline run complete" INFO line alone while some
+        # Discord delivery actually failed -- this WARNING line is the
+        # explicit, hard-to-miss signal (fail-soft: run_once still returns
+        # normally and scripts/run.py still exits 0).
+        logger.warning(
+            "pipeline completed with Discord delivery failures",
+            extra={
+                "fields": {
+                    "notification_delivery_failures": stats.notification_delivery_failures,
+                    "alerts_pending": stats.alerts_pending,
+                    "review_digest_chunks_failed": stats.review_digest_chunks_failed,
+                }
+            },
+        )
     return stats
 
 
-def _notify_source_transition(notifier: DiscordNotifier, prev_health, result) -> str | None:
+def _is_real_attempt(notifier: DiscordNotifier) -> bool:
+    """True only if a False return from the notifier represents an actual
+    rejected/failed Discord delivery attempt -- i.e. not dry-run (which
+    always returns False by design) and not simply unconfigured."""
+    return not notifier.dry_run and notifier.enabled
+
+
+def _notify_source_transition(
+    notifier: DiscordNotifier, prev_health, result
+) -> tuple[str | None, bool]:
     """Fire an immediate failure/recovery notification only for a high
     priority (company_priority==1) source's healthy<->failed transition.
     No repeated alert while it stays failed; persistent failures instead
-    surface in the daily summary via source_health. Returns "failed",
-    "recovered", or None."""
+    surface in the daily summary via source_health. Returns
+    (transition, delivered) where transition is "failed", "recovered", or
+    None (no transition -> no attempt made, delivered is always False)."""
     if result.company_priority != 1:
-        return None
+        return None, False
     prev_status = prev_health["last_status"] if prev_health is not None else None
     was_failed = prev_status == SourceStatus.error.value
     is_failed = result.status == SourceStatus.error
     if not was_failed and is_failed:
-        notifier.send_source_failure(result.source_id, result.company, result.error)
-        return "failed"
+        delivered = notifier.send_source_failure(result.source_id, result.company, result.error)
+        return "failed", delivered
     if was_failed and not is_failed:
-        notifier.send_source_recovery(result.source_id, result.company)
-        return "recovered"
-    return None
+        delivered = notifier.send_source_recovery(result.source_id, result.company)
+        return "recovered", delivered
+    return None, False
 
 
 def _enqueue_if_warranted(
@@ -271,11 +336,15 @@ def _enqueue_if_warranted(
 def _send_job_alerts(conn, notifier: DiscordNotifier, config: Config) -> tuple[int, int]:
     """Send individual (non-digest) urgent/strong-match alerts, ordered by
     company priority, up to max_alerts_per_run. Excess and any failed sends
-    stay pending for a later run."""
+    stay pending for a later run. Returns (sent, failed) -- ``failed`` counts
+    only genuine rejected/errored delivery attempts (never dry-run or
+    unconfigured-webhook skips, which are not delivery failures)."""
     pending = db.get_pending_alerts(conn, AlertChannel.discord)
     individual = [p for p in pending if p["priority"] in ("p1", "p2", "p3")]
     cap = config.notifications.max_alerts_per_run
+    real_attempt = _is_real_attempt(notifier)
     sent = 0
+    failed = 0
     for row in individual[:cap]:
         record = db.get_job(conn, row["job_id"])
         if record is None:
@@ -283,40 +352,54 @@ def _send_job_alerts(conn, notifier: DiscordNotifier, config: Config) -> tuple[i
         if notifier.send_job_alert(record):
             db.mark_alert_sent(conn, row["job_id"], AlertChannel.discord)
             sent += 1
-    pending_remaining = len(individual) - sent
-    return sent, pending_remaining
+        elif real_attempt:
+            failed += 1
+    return sent, failed
 
 
-def _send_review_digest(conn, notifier: DiscordNotifier, config: Config) -> bool:
-    """Batch all pending Eligibility Review jobs into ONE digest message
-    (never one message per job). All-or-nothing: only marked sent if the
-    single digest message is accepted."""
+def _send_review_digest(conn, notifier: DiscordNotifier, config: Config) -> tuple[bool, int, int]:
+    """Batch all pending Eligibility Review jobs into one or more digest
+    messages (never one message per job), chunked as needed to respect
+    Discord's payload limits (see gradscout.notify.discord). Each chunk is
+    marked sent independently: a job is only ever flipped to 'sent' if the
+    specific chunk containing it received a 2xx; every job in a failed or
+    unattempted chunk stays pending.
+
+    Returns (fully_sent, chunks_sent, chunks_failed) where fully_sent is True
+    only if at least one chunk was attempted and none of them failed."""
     if not config.notifications.send_review_digest:
-        return False
+        return False, 0, 0
     pending = db.get_pending_alerts(conn, AlertChannel.discord)
     review_rows = [p for p in pending if p["priority"] == "review"][:MAX_DIGEST_ITEMS]
     if not review_rows:
-        return False
+        return False, 0, 0
     records = [r for r in (db.get_job(conn, row["job_id"]) for row in review_rows) if r]
     if not records:
-        return False
-    if notifier.send_review_digest(records):
-        for row in review_rows:
+        return False, 0, 0
+    result = notifier.send_review_digest(records)
+    delivered_ids = {r.job_id for r in result.delivered}
+    for row in review_rows:
+        if row["job_id"] in delivered_ids:
             db.mark_alert_sent(conn, row["job_id"], AlertChannel.discord)
-        return True
-    return False
+    fully_sent = result.chunks_sent > 0 and result.chunks_failed == 0
+    return fully_sent, result.chunks_sent, result.chunks_failed
 
 
-def _maybe_send_daily_summary(conn, notifier: DiscordNotifier, config: Config, now: datetime) -> bool:
+def _maybe_send_daily_summary(
+    conn, notifier: DiscordNotifier, config: Config, now: datetime
+) -> tuple[bool, bool]:
     """Send at most one health summary per UTC calendar day, at the
-    configured hour, guarded by the meta table (never hourly)."""
+    configured hour, guarded by the meta table (never hourly). Returns
+    (sent, failed) -- failed is only True for a genuine rejected/errored
+    delivery attempt at the configured hour (never for "not due yet" or
+    "already sent today", and never for dry-run/unconfigured skips)."""
     if now.hour != config.notifications.daily_summary_hour_utc:
-        return False
+        return False, False
     date_key = now.strftime("%Y-%m-%d")
     if db.get_meta(conn, "daily_summary_last_date") == date_key:
-        return False
+        return False, False
     rows = db.get_source_health(conn)
     if notifier.send_daily_summary(rows, date_key):
         db.set_meta(conn, "daily_summary_last_date", date_key)
-        return True
-    return False
+        return True, False
+    return False, _is_real_attempt(notifier)
