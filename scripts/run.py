@@ -88,9 +88,24 @@ def main() -> int:
                 "jobs_changed": stats.jobs_changed,
                 "alerts_sent": stats.alerts_sent,
                 "alerts_pending": stats.alerts_pending,
+                "notification_delivery_failures": stats.notification_delivery_failures,
             }
         },
     )
+    if stats.notification_delivery_failures:
+        # Fail-soft by design (exit code stays 0 -- collection/classification/
+        # persistence all still succeeded), but this WARNING line is what
+        # makes a partial notification failure impossible to miss in a
+        # GitHub Actions log even though the job itself is "green".
+        log.warning(
+            "one or more Discord notifications failed to deliver this run",
+            extra={
+                "fields": {
+                    "notification_delivery_failures": stats.notification_delivery_failures,
+                    "alerts_pending": stats.alerts_pending,
+                }
+            },
+        )
     return 0
 
 

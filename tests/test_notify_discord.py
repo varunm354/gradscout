@@ -19,7 +19,16 @@ from gradscout.models import (
     ResumeVariant,
     RoleFamily,
 )
-from gradscout.notify.discord import DiscordNotifier
+from gradscout.notify.discord import (
+    MAX_EMBEDS_PER_MESSAGE,
+    MAX_FIELD_VALUE_LEN,
+    MAX_FIELDS_PER_EMBED,
+    MAX_TITLE_LEN,
+    MAX_TOTAL_CHARS_PER_MESSAGE,
+    DiscordNotifier,
+    _fits_message_limits,
+    _payload_char_len,
+)
 
 
 def make_record(**overrides) -> JobRecord:
@@ -183,7 +192,10 @@ def test_review_digest_batches_all_jobs_into_one_message():
     client = _client_with(handler)
     notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
     jobs = [make_record(job_id=i, title=f"Job {i}") for i in range(1, 4)]
-    assert notifier.send_review_digest(jobs) is True
+    result = notifier.send_review_digest(jobs)
+    assert result.chunks_sent == 1
+    assert result.chunks_failed == 0
+    assert {j.job_id for j in result.delivered} == {1, 2, 3}
     assert len(calls) == 1  # ONE message, not three
 
     embed = json.loads(calls[0].content)["embeds"][0]
@@ -212,7 +224,10 @@ def test_empty_review_digest_sends_nothing():
     handler, calls = _capturing()
     client = _client_with(handler)
     notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
-    assert notifier.send_review_digest([]) is False
+    result = notifier.send_review_digest([])
+    assert result.delivered == []
+    assert result.chunks_sent == 0
+    assert result.chunks_failed == 0
     assert calls == []
 
 
@@ -234,3 +249,246 @@ def test_source_failure_and_recovery_messages():
 
     recovery_embed = json.loads(calls[1].content)["embeds"][0]
     assert "recovered" in recovery_embed["title"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5.3 postmortem fix: Discord payload-limit enforcement, chunking, and
+# no-lost-alerts regression coverage.
+#
+# Production observed: HTTP 400 {"embeds": ["Embed size exceeds maximum size
+# of 6000"]} from a review-digest message carrying 6 long alerts, alongside
+# alerts_enqueued=6 / alerts_sent=0 / alerts_pending=0. Root cause:
+# `_digest_embed` packed every pending review job into ONE embed with only
+# per-field (not aggregate) truncation, and the 6 review-priority alerts were
+# invisible to the individual-alert pending count. Fixed by: conservative
+# per-field shortening everywhere, defensive pre-send aggregate/field/embed-
+# count enforcement, and splitting an oversized review digest into multiple
+# independently-delivered chunks.
+# --------------------------------------------------------------------------- #
+def _review_job(job_id: int, *, long: bool = True) -> JobRecord:
+    """A review-priority job whose digest FIELD is deliberately oversized (a
+    ~150-char company/title pair and a >1000-char eligibility reason) so that,
+    after `_field`'s per-field shortening, it reliably contributes EXACTLY
+    MAX_FIELD_NAME_LEN + MAX_FIELD_VALUE_LEN characters to a digest embed --
+    or a short realistic one when ``long`` is False."""
+    if long:
+        company = "Company " + ("C" * 150)
+        title = "T" * 150
+        apply_url = "https://boards.greenhouse.io/acme/jobs/" + ("u" * 100) + str(job_id)
+        reason = "R" * 1200
+    else:
+        company = "Acme"
+        title = f"Reviewable Job {job_id}"
+        apply_url = f"https://boards.greenhouse.io/acme/jobs/{job_id}"
+        reason = "Needs manual review"
+    return make_record(
+        job_id=job_id,
+        url_canonical=apply_url,
+        company=company,
+        title=title,
+        apply_url=apply_url,
+        eligibility_status=EligibilityStatus.review,
+        eligibility_reasons=[reason],
+        alert_priority=AlertPriority.review,
+        recommended_resume=None,
+        resume_confidence=None,
+        resume_reason=None,
+        location_classification=LocationClassification.unclear,
+    )
+
+
+def test_job_embed_shortens_oversized_field_values_with_ellipsis():
+    """An oversized field value (e.g. a company/location string from
+    untrusted source data) is shortened, never dropped, and always ends with
+    an ellipsis so a human reader knows it was cut."""
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    huge_location = "L" * 5000
+    huge_title = "T" * 5000
+    notifier.send_job_alert(make_record(location=huge_location, title=huge_title))
+
+    embed = json.loads(calls[0].content)["embeds"][0]
+    assert len(embed["title"]) <= MAX_TITLE_LEN
+    assert embed["title"].endswith("…")
+    by_name = {f["name"]: f["value"] for f in embed["fields"]}
+    assert len(by_name["Location"]) <= MAX_FIELD_VALUE_LEN
+    assert by_name["Location"].endswith("…")
+    # The whole job is still sent -- oversized text is shortened, not dropped.
+    assert len(calls) == 1
+
+
+def test_job_alert_payload_always_complies_with_discord_limits():
+    """Defense in depth: whatever a single job alert's raw content looks
+    like, the actual payload sent must comply with our conservative internal
+    ceilings (which are themselves below Discord's hard limits)."""
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    notifier.send_job_alert(
+        make_record(company="C" * 5000, location="L" * 5000, title="T" * 5000)
+    )
+    embed = json.loads(calls[0].content)["embeds"][0]
+    assert _fits_message_limits([embed])
+
+
+# --- Requirement 7: payload just below / above the character limit -------- #
+def test_digest_payload_just_below_char_limit_sent_as_one_message():
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    jobs = [_review_job(i) for i in range(5)]  # verified below MAX_TOTAL_CHARS_PER_MESSAGE
+    result = notifier.send_review_digest(jobs)
+
+    assert len(calls) == 1
+    embed = json.loads(calls[0].content)["embeds"][0]
+    assert _payload_char_len([embed]) <= MAX_TOTAL_CHARS_PER_MESSAGE
+    assert result.chunks_sent == 1
+    assert result.chunks_failed == 0
+    assert {j.job_id for j in result.delivered} == {j.job_id for j in jobs}
+
+
+def test_digest_payload_above_char_limit_is_split_into_multiple_messages():
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    jobs = [_review_job(i) for i in range(6)]  # verified above MAX_TOTAL_CHARS_PER_MESSAGE as 1 embed
+    result = notifier.send_review_digest(jobs)
+
+    assert len(calls) > 1  # split into multiple valid Discord messages
+    for call in calls:
+        embed = json.loads(call.content)["embeds"][0]
+        assert _fits_message_limits([embed])
+    # No job silently dropped by the split.
+    assert {j.job_id for j in result.delivered} == {j.job_id for j in jobs}
+    assert result.chunks_sent == len(calls)
+    assert result.chunks_failed == 0
+
+
+# --- Requirement 7: more than 10 embeds / more than 25 fields ------------- #
+def test_more_than_10_embeds_in_one_message_is_refused_before_sending():
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    embeds = [{"title": f"E{i}", "fields": []} for i in range(MAX_EMBEDS_PER_MESSAGE + 1)]
+    assert _fits_message_limits(embeds) is False
+    assert notifier._post({"embeds": embeds}) is False
+    assert calls == []  # refused before ever touching the network
+
+
+def test_more_than_25_fields_is_split_across_multiple_embeds():
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    jobs = [_review_job(i, long=False) for i in range(30)]  # short content -> field-count-driven split
+    result = notifier.send_review_digest(jobs)
+
+    assert len(calls) > 1
+    for call in calls:
+        embed = json.loads(call.content)["embeds"][0]
+        assert len(embed["fields"]) <= MAX_FIELDS_PER_EMBED
+    assert {j.job_id for j in result.delivered} == {j.job_id for j in jobs}
+
+
+# --- Requirement 7: first-chunk-succeeds/second-fails, and first-fails ---- #
+def test_digest_second_chunk_fails_first_chunk_still_delivered():
+    jobs = [_review_job(i) for i in range(6)]  # 2 chunks, per prior test
+    statuses = iter([204, 400])
+    calls: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(next(statuses))
+
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    result = notifier.send_review_digest(jobs)
+
+    assert len(calls) == 2
+    assert result.chunks_sent == 1
+    assert result.chunks_failed == 1
+    # First chunk's jobs are delivered; second chunk's jobs are NOT -- they
+    # must remain pending, not lost and not marked sent.
+    first_chunk_ids = {j.job_id for j in jobs[:5]}
+    second_chunk_ids = {j.job_id for j in jobs[5:]}
+    delivered_ids = {j.job_id for j in result.delivered}
+    assert delivered_ids == first_chunk_ids
+    assert delivered_ids.isdisjoint(second_chunk_ids)
+
+
+def test_digest_first_chunk_fails_second_chunk_still_attempted_and_delivered():
+    jobs = [_review_job(i) for i in range(6)]  # 2 chunks
+    statuses = iter([400, 204])
+    calls: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(next(statuses))
+
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    result = notifier.send_review_digest(jobs)
+
+    assert len(calls) == 2
+    assert result.chunks_sent == 1
+    assert result.chunks_failed == 1
+    first_chunk_ids = {j.job_id for j in jobs[:5]}
+    second_chunk_ids = {j.job_id for j in jobs[5:]}
+    delivered_ids = {j.job_id for j in result.delivered}
+    # The failed first chunk's jobs are never marked delivered...
+    assert delivered_ids.isdisjoint(first_chunk_ids)
+    # ...but the independent second chunk still got through.
+    assert delivered_ids == second_chunk_ids
+
+
+def test_digest_dry_run_makes_no_calls_and_reports_no_failures():
+    """Dry-run must never look like a delivery FAILURE -- it's an
+    intentional no-op, distinct from a rejected/errored send."""
+    jobs = [_review_job(i) for i in range(6)]  # would be 2 chunks if actually sent
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", dry_run=True)
+    result = notifier.send_review_digest(jobs)
+    assert result.delivered == []
+    assert result.chunks_sent == 0
+    assert result.chunks_failed == 0  # NOT a failure -- dry-run is a deliberate skip
+
+
+# --- Requirement 8: production reproduction -------------------------------- #
+def test_reproduces_production_incident_six_long_alerts_all_requests_comply():
+    """Exact production reproduction: 6 long Eligibility Review alerts that,
+    prior to this fix, were packed into a single oversized embed and
+    rejected by Discord with HTTP 400 ``Embed size exceeds maximum size of
+    6000``. Proves every resulting HTTP request now complies with Discord's
+    real limits, and that all 6 jobs are still delivered (across however
+    many messages it takes), none lost."""
+    handler, calls = _capturing(status_code=204)
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    jobs = [_review_job(i) for i in range(6)]
+
+    # Sanity check: the OLD (pre-fix) unbounded single embed of this content
+    # -- which only truncated each field to Discord's own per-field caps
+    # (256 name / 1024 value), with no aggregate check -- really would have
+    # exceeded Discord's real 6000-char hard limit. This is the exact
+    # production failure mode being fixed.
+    from gradscout.notify.discord import DISCORD_MAX_TOTAL_CHARS
+
+    naive_chars = 0
+    for j in jobs:
+        reason = j.eligibility_reasons[0]
+        name = f"{j.company} — {j.title}"[:256]
+        value = f"[Apply]({j.apply_url}) · {reason}"[:1024]
+        naive_chars += len(name) + len(value)
+    assert naive_chars > DISCORD_MAX_TOTAL_CHARS
+
+    result = notifier.send_review_digest(jobs)
+
+    assert len(calls) >= 2  # split into multiple compliant messages
+    for call in calls:
+        body = json.loads(call.content)
+        assert _fits_message_limits(body["embeds"])
+        for embed in body["embeds"]:
+            assert len(embed["fields"]) <= MAX_FIELDS_PER_EMBED
+        assert len(body["embeds"]) <= MAX_EMBEDS_PER_MESSAGE
+    # All 6 production alerts are accounted for -- none silently dropped.
+    assert {j.job_id for j in result.delivered} == {j.job_id for j in jobs}
+    assert result.chunks_failed == 0
