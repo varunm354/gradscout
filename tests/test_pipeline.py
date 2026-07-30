@@ -62,7 +62,19 @@ class FakeCollector(Collector):
         return list(payload), 0
 
 
-def _row(title: str, desc: str, *, job_id: str, posted_at=NOW, company="Acme") -> RawJob:
+def _row(
+    title: str,
+    desc: str,
+    *,
+    job_id: str,
+    posted_at=NOW,
+    company="Acme",
+    location: str | None = "San Francisco, CA",
+) -> RawJob:
+    # Defaults to a preferred (Bay Area) location (Phase 5.2) so every existing
+    # dedupe/baseline/priority assertion in this file and tests/test_baseline.py
+    # (which reuses this helper) keeps passing unaffected by location gating --
+    # see tests/test_location_pipeline.py for location-specific end-to-end cases.
     return RawJob(
         source=SourceType.greenhouse,
         source_company="acme",
@@ -72,6 +84,7 @@ def _row(title: str, desc: str, *, job_id: str, posted_at=NOW, company="Acme") -
         description_text=desc,
         apply_url=f"https://boards.greenhouse.io/acme/jobs/{job_id}",
         source_posted_at=posted_at,
+        location=location,
     )
 
 

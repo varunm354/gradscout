@@ -72,7 +72,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     resume_reason      TEXT,
     alert_priority     TEXT NOT NULL,
     llm_used           INTEGER NOT NULL DEFAULT 0,
-    raw_blob           TEXT NOT NULL DEFAULT '{}'
+    raw_blob           TEXT NOT NULL DEFAULT '{}',
+    location_classification TEXT NOT NULL DEFAULT 'unclear',
+    location_reason    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_priority ON jobs(alert_priority);
 
@@ -146,7 +148,24 @@ def connect(db_path: str | Path = "data/gradscout.db") -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _ensure_location_columns(conn)
     conn.commit()
+
+
+def _ensure_location_columns(conn: sqlite3.Connection) -> None:
+    """Phase 5.2 migration: add the location_classification/location_reason
+    columns to a pre-existing ``jobs`` table (e.g. a DB restored from the
+    ``state`` branch) that predates this feature. ``CREATE TABLE IF NOT EXISTS``
+    never alters an already-existing table, so this ALTER TABLE step is the only
+    way an older DB picks up the new columns. Idempotent and safe to call on a
+    brand-new DB too (SCHEMA already created the columns, so this is a no-op)."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "location_classification" not in cols:
+        conn.execute(
+            "ALTER TABLE jobs ADD COLUMN location_classification TEXT NOT NULL DEFAULT 'unclear'"
+        )
+    if "location_reason" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN location_reason TEXT")
 
 
 # --------------------------------------------------------------------------- #
@@ -217,8 +236,8 @@ def upsert_job(conn: sqlite3.Connection, job: Job, now: datetime | None = None) 
                 first_seen_at, last_seen_at, eligibility_status, eligibility_reasons,
                 role_family, role_priority, employment_type, is_new_grad,
                 recommended_resume, resume_confidence, resume_reason, alert_priority,
-                llm_used, raw_blob
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                llm_used, raw_blob, location_classification, location_reason
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 job.url_canonical,
@@ -245,6 +264,8 @@ def upsert_job(conn: sqlite3.Connection, job: Job, now: datetime | None = None) 
                 job.alert_priority.value,
                 int(job.llm_used),
                 json.dumps(job.raw_blob),
+                job.location_classification.value,
+                job.location_reason,
             ),
         )
         job_id = int(cur.lastrowid)
@@ -298,7 +319,7 @@ def apply_classification(
             company_priority=?, eligibility_status=?, eligibility_reasons=?,
             role_family=?, role_priority=?, employment_type=?, is_new_grad=?,
             recommended_resume=?, resume_confidence=?, resume_reason=?,
-            alert_priority=?, llm_used=?
+            alert_priority=?, llm_used=?, location_classification=?, location_reason=?
         WHERE job_id=?
         """,
         (
@@ -314,6 +335,8 @@ def apply_classification(
             resolved.resume_reason,
             resolved.alert_priority.value,
             int(resolved.llm_used),
+            resolved.location_classification.value,
+            resolved.location_reason,
             job_id,
         ),
     )
@@ -391,6 +414,8 @@ def _row_to_record(conn: sqlite3.Connection, row: sqlite3.Row) -> JobRecord:
         resume_reason=row["resume_reason"],
         alert_priority=row["alert_priority"],
         llm_used=bool(row["llm_used"]),
+        location_classification=row["location_classification"],
+        location_reason=row["location_reason"],
         sources=sources,
     )
 

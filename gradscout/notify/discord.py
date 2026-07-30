@@ -25,7 +25,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from gradscout.models import AlertPriority, JobRecord
+from gradscout.location import location_label
+from gradscout.models import AlertPriority, JobRecord, LocationClassification
 
 logger = logging.getLogger("gradscout.notify.discord")
 
@@ -54,6 +55,13 @@ def _job_embed(job: JobRecord) -> dict:
     ]
     if job.location:
         fields.append({"name": "Location", "value": job.location, "inline": True})
+    fields.append(
+        {
+            "name": "Location fit",
+            "value": location_label(job.location_classification),
+            "inline": True,
+        }
+    )
 
     resume_value = "-"
     if job.recommended_resume:
@@ -84,15 +92,23 @@ def _job_embed(job: JobRecord) -> dict:
     }
 
 
+_DIGEST_NOTEWORTHY_LOCATIONS = (LocationClassification.out_of_region, LocationClassification.unclear)
+
+
 def _digest_embed(jobs: list[JobRecord]) -> dict:
     shown = jobs[:MAX_DIGEST_ITEMS]
     fields = []
     for j in shown:
         reason = j.eligibility_reasons[0] if j.eligibility_reasons else "Needs manual review"
+        value = f"[Apply]({j.apply_url}) · {reason}"
+        # Only call out location when it's the interesting case for a human reviewer
+        # (preferred/remote_acceptable is unremarkable and would just add noise).
+        if j.location_classification in _DIGEST_NOTEWORTHY_LOCATIONS:
+            value += f" · Location: {location_label(j.location_classification)}"
         fields.append(
             {
                 "name": f"{j.company} — {j.title}"[:256],
-                "value": f"[Apply]({j.apply_url}) · {reason}"[:1024],
+                "value": value[:1024],
                 "inline": False,
             }
         )

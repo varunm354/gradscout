@@ -24,6 +24,7 @@ from gradscout import db
 from gradscout.analyze import apply_to_job, classify_job
 from gradscout.collectors.base import Collector, run_collector
 from gradscout.llm import JobAnalysisAgent
+from gradscout.location import location_permits_alert
 from gradscout.models import (
     AlertChannel,
     AlertPriority,
@@ -230,12 +231,20 @@ def _enqueue_if_warranted(
     historical P2/P3-eligible jobs are stored but never alerted -- this is
     what stops a fresh first run from flooding Discord with thousands of
     already-open historical listings.
+
+    Phase 5.2: a job's location classification (preferred / remote_acceptable /
+    out_of_region / unclear -- see gradscout.location) additionally gates ONLY
+    this normal/baseline "eligible" alert path, never the eligibility-review
+    digest path just below -- a review-status job always reaches the digest
+    regardless of location, and an eligible-but-out_of_region/unclear job is
+    simply stored and never alerted at all (not even to the digest).
     """
     if is_baseline_run:
         if (
             resolved.eligibility_status == EligibilityStatus.eligible
             and resolved.alert_priority == AlertPriority.p1
             and meets_min_priority(resolved.alert_priority, config.notifications.discord_min_priority)
+            and location_permits_alert(resolved.location_classification, config.candidate)
         ):
             return db.enqueue_alert(
                 conn, job_id, AlertChannel.discord, resolved.alert_priority.value, now=now
@@ -248,8 +257,10 @@ def _enqueue_if_warranted(
         return db.enqueue_alert(
             conn, job_id, AlertChannel.discord, resolved.alert_priority.value, now=now
         )
-    if resolved.eligibility_status == EligibilityStatus.eligible and meets_min_priority(
-        resolved.alert_priority, config.notifications.discord_min_priority
+    if (
+        resolved.eligibility_status == EligibilityStatus.eligible
+        and meets_min_priority(resolved.alert_priority, config.notifications.discord_min_priority)
+        and location_permits_alert(resolved.location_classification, config.candidate)
     ):
         return db.enqueue_alert(
             conn, job_id, AlertChannel.discord, resolved.alert_priority.value, now=now

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from gradscout.eligibility import evaluate_eligibility
 from gradscout.llm import JobAnalysisAgent
+from gradscout.location import classify_location
 from gradscout.models import (
     AgentAnalysis,
     AlertPriority,
@@ -22,12 +23,14 @@ from gradscout.models import (
     EligibilityStatus,
     EmploymentType,
     Job,
+    LocationClassification,
     ResolvedAnalysis,
     ResumeConfidence,
     ResumeVariant,
     RoleFamily,
 )
 from gradscout.prioritize import (
+    apply_location_penalty,
     resolve_company_priority,
     score_alert_priority,
     score_role_priority,
@@ -56,6 +59,9 @@ class DeterministicAnalysis:
     role_priority: int
     alert_priority: AlertPriority
     is_recent: bool
+    location_classification: LocationClassification
+    location_reason: str | None
+    remote_alert_penalty: int
 
 
 def analyze_deterministic(job: Job, config: Config, is_recent: bool = True) -> DeterministicAnalysis:
@@ -74,6 +80,12 @@ def analyze_deterministic(job: Job, config: Config, is_recent: bool = True) -> D
         resume.confidence if resume else None,
         is_recent,
     )
+    # Location fit (Phase 5.2) is computed independently of eligibility -- it never
+    # changes elig.status/reasons, only the alert_priority penalty applied here (and,
+    # separately, whether a normal alert is enqueued at all -- see gradscout.pipeline).
+    loc = classify_location(job.location, job.remote, config.candidate.preferred_locations)
+    penalty = config.candidate.remote_alert_priority_penalty
+    alert_priority = apply_location_penalty(alert_priority, loc.classification, penalty)
     return DeterministicAnalysis(
         status=elig.status,
         reasons=list(elig.reasons),
@@ -91,6 +103,9 @@ def analyze_deterministic(job: Job, config: Config, is_recent: bool = True) -> D
         role_priority=role_priority,
         alert_priority=alert_priority,
         is_recent=is_recent,
+        location_classification=loc.classification,
+        location_reason=loc.reason,
+        remote_alert_penalty=penalty,
     )
 
 
@@ -100,6 +115,10 @@ def resolve(det: DeterministicAnalysis, agent_out: AgentAnalysis | None) -> Reso
         employment_type=det.employment_type,
         is_new_grad=det.is_new_grad,
         company_priority=det.company_priority,
+        # Location is a hard boundary the LLM never sees or influences (same
+        # deterministic-only treatment as hard_ineligible), carried through unchanged.
+        location_classification=det.location_classification,
+        location_reason=det.location_reason,
     )
 
     if agent_out is None:
@@ -158,6 +177,9 @@ def resolve(det: DeterministicAnalysis, agent_out: AgentAnalysis | None) -> Reso
         final_status, det.company_priority, det.role_priority, det.relevant,
         resume_conf, det.is_recent,
     )
+    alert_priority = apply_location_penalty(
+        alert_priority, det.location_classification, det.remote_alert_penalty
+    )
     disagreement_reason = agent_out.disagreement_reason or (
         f"deterministic='{det.status.value}', llm='{final_status.value}'"
         if disagreement
@@ -204,6 +226,8 @@ def apply_to_job(job: Job, resolved: ResolvedAnalysis) -> Job:
     job.company_priority = resolved.company_priority
     job.alert_priority = resolved.alert_priority
     job.llm_used = resolved.llm_used
+    job.location_classification = resolved.location_classification
+    job.location_reason = resolved.location_reason
     return job
 
 

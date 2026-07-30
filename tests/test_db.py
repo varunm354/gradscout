@@ -11,6 +11,7 @@ from gradscout.models import (
     EligibilityStatus,
     EmploymentType,
     Job,
+    LocationClassification,
     ResolvedAnalysis,
     RoleFamily,
     SourceStatus,
@@ -375,3 +376,74 @@ def test_pending_alerts_ordered_by_company_priority(conn):
     db.enqueue_alert(conn, jid_high, AlertChannel.discord, "p1")
     order = [p["job_id"] for p in db.get_pending_alerts(conn, AlertChannel.discord)]
     assert order == [jid_high, jid_low]   # highest priority company first
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5.2: location_classification/location_reason schema migration.
+# --------------------------------------------------------------------------- #
+# A literal snapshot of the pre-Phase-5.2 ``jobs`` table (no location columns),
+# standing in for a DB restored from the 'state' branch before this feature shipped.
+_PRE_LOCATION_JOBS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    url_canonical      TEXT NOT NULL UNIQUE,
+    company            TEXT NOT NULL,
+    company_priority   INTEGER NOT NULL,
+    title              TEXT NOT NULL,
+    location           TEXT,
+    remote             INTEGER,
+    description_text   TEXT,
+    apply_url          TEXT NOT NULL,
+    source_posted_at   TEXT,
+    content_hash       TEXT NOT NULL DEFAULT '',
+    first_seen_at      TEXT NOT NULL,
+    last_seen_at       TEXT NOT NULL,
+    eligibility_status TEXT NOT NULL,
+    eligibility_reasons TEXT NOT NULL,
+    role_family        TEXT NOT NULL,
+    role_priority      INTEGER NOT NULL,
+    employment_type    TEXT NOT NULL,
+    is_new_grad        INTEGER,
+    recommended_resume TEXT,
+    resume_confidence  TEXT,
+    resume_reason      TEXT,
+    alert_priority     TEXT NOT NULL,
+    llm_used           INTEGER NOT NULL DEFAULT 0,
+    raw_blob           TEXT NOT NULL DEFAULT '{}'
+);
+"""
+
+
+def test_legacy_db_without_location_columns_is_migrated():
+    """A DB created before Phase 5.2 (e.g. restored from the 'state' branch) has
+    no location_classification/location_reason columns. init_db() must add them
+    via ALTER TABLE without error, defaulting to 'unclear'/NULL, and existing
+    upsert_job/apply_classification/get_job must keep working against it."""
+    conn = db.connect(":memory:")
+    conn.executescript(_PRE_LOCATION_JOBS_SCHEMA)
+    conn.commit()
+    cols_before = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    assert "location_classification" not in cols_before
+
+    db.init_db(conn)  # re-running init_db is the migration path
+    cols_after = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    assert {"location_classification", "location_reason"} <= cols_after
+
+    job = make_job(
+        source=SourceType.greenhouse, source_company="acme", source_job_id="1",
+        apply_url="https://boards.greenhouse.io/acme/jobs/1",
+    )
+    jid = db.upsert_job(conn, job).job_id
+    rec = db.get_job(conn, jid)
+    assert rec.location_classification.value == "unclear"
+    assert rec.location_reason is None
+
+    resolved = _resolved(
+        location_classification=LocationClassification.preferred,
+        location_reason="Matches a preferred Bay Area / Northern California location: 'oakland'",
+    )
+    db.apply_classification(conn, jid, resolved)
+    rec2 = db.get_job(conn, jid)
+    assert rec2.location_classification.value == "preferred"
+    assert rec2.location_reason == "Matches a preferred Bay Area / Northern California location: 'oakland'"
+    conn.close()
