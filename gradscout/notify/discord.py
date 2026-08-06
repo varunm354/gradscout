@@ -154,8 +154,14 @@ def _job_embed(job: JobRecord) -> dict:
 
     resume_value = "-"
     if job.recommended_resume:
-        conf = f" ({job.resume_confidence.value} confidence)" if job.resume_confidence else ""
-        resume_value = f"{job.recommended_resume.value}{conf}"
+        # Phase 6: name the concrete match score alongside confidence, e.g.
+        # "ai (78% match, high confidence)" -- the *why* (top matched
+        # skills/technologies) lives in the embed description via
+        # job.resume_reason, never just this bare percentage.
+        score = f"{job.resume_match_score}% match, " if job.resume_match_score is not None else ""
+        conf = f"{job.resume_confidence.value} confidence" if job.resume_confidence else ""
+        detail = f" ({score}{conf})" if (score or conf) else ""
+        resume_value = f"{job.recommended_resume.value}{detail}"
     fields.append(_field("Recommended resume", resume_value))
 
     # Never describe first_seen_at as a posting date: label the two distinctly.
@@ -183,6 +189,10 @@ def _digest_field(j: JobRecord) -> dict:
     # (preferred/remote_acceptable is unremarkable and would just add noise).
     if j.location_classification in _DIGEST_NOTEWORTHY_LOCATIONS:
         value += f" · Location: {location_label(j.location_classification)}"
+    # Phase 6: compact resume-match suffix (e.g. " · ai 78%"), still within
+    # the existing field-value character budget enforcement (_field shortens).
+    if j.recommended_resume and j.resume_match_score is not None:
+        value += f" · {j.recommended_resume.value} {j.resume_match_score}%"
     return _field(f"{j.company} — {j.title}", value, inline=False)
 
 

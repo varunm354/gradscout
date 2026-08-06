@@ -1,11 +1,22 @@
-from gradscout.models import ResumeConfidence, ResumeVariant, RoleFamily
-from gradscout.resume import recommend_resume
+from gradscout.models import Config, ResumeConfidence, ResumeVariant, RoleFamily
+from gradscout.resume import build_matcher_from_config, recommend_resume
 from gradscout.roles import classify_role
 from tests.conftest import make_job
+
+# No resume_profiles configured -> recommend_resume falls back to the
+# pre-Phase-6 role-family-only mapping (see gradscout.resume._fallback_recommend).
+# Dedicated weighted-profile scoring tests live in tests/test_resume_matching.py.
+_NO_PROFILE_MATCHER = build_matcher_from_config(Config())
 
 
 def _family(title, desc=""):
     return classify_role(make_job(title, desc)).family
+
+
+def _recommend(title, desc=""):
+    job = make_job(title, desc)
+    roles = classify_role(job)
+    return recommend_resume(job, roles, _NO_PROFILE_MATCHER)
 
 
 # --- role classification ---
@@ -74,32 +85,29 @@ def test_ambiguous_title_is_other_even_with_thin_description():
     assert _family("Program Coordinator", "General office support.") == RoleFamily.other
 
 
-# --- resume recommendation ---
+# --- resume recommendation (fallback: no resume_profiles configured) ---
 def test_resume_ai_for_ai_role():
-    roles = classify_role(make_job("ML Engineer", "Deep learning, PyTorch, inference at scale."))
-    rec = recommend_resume(roles)
+    rec = _recommend("ML Engineer", "Deep learning, PyTorch, inference at scale.")
     assert rec.variant == ResumeVariant.ai
     assert rec.confidence in (ResumeConfidence.high, ResumeConfidence.medium)
 
 
 def test_resume_data_for_data_role():
-    roles = classify_role(make_job("Analytics Engineer", "dbt, SQL, data warehouse, BI."))
-    assert recommend_resume(roles).variant == ResumeVariant.data
+    assert _recommend("Analytics Engineer", "dbt, SQL, data warehouse, BI.").variant == (
+        ResumeVariant.data
+    )
 
 
 def test_resume_backend_for_generic_swe():
-    roles = classify_role(make_job("Software Engineer", "General engineering."))
-    assert recommend_resume(roles).variant == ResumeVariant.backend
+    assert _recommend("Software Engineer", "General engineering.").variant == ResumeVariant.backend
 
 
 def test_resume_backend_for_product_role():
-    roles = classify_role(make_job("Product Engineer", "Own product features."))
-    rec = recommend_resume(roles)
+    rec = _recommend("Product Engineer", "Own product features.")
     assert rec.variant == ResumeVariant.backend
 
 
 def test_resume_other_is_low_confidence_backend():
-    roles = classify_role(make_job("Recruiter", "Hire people."))
-    rec = recommend_resume(roles)
+    rec = _recommend("Recruiter", "Hire people.")
     assert rec.variant == ResumeVariant.backend
     assert rec.confidence == ResumeConfidence.low

@@ -11,6 +11,7 @@ from gradscout.collectors.base import Collector
 from gradscout.collectors.github_repo import GithubRepoCollector
 from gradscout.collectors.greenhouse import GreenhouseCollector
 from gradscout.collectors.lever import LeverCollector
+from gradscout.collectors.rippling import RipplingCollector
 from gradscout.models import Config
 
 
@@ -22,6 +23,8 @@ def build_collectors(config: Config) -> list[Collector]:
         collectors.append(LeverCollector(s.company, s.board, s.company_priority))
     for s in config.ashby:
         collectors.append(AshbyCollector(s.company, s.board, s.company_priority))
+    for s in config.rippling:
+        collectors.append(RipplingCollector(s.company, s.board, s.company_priority))
     for r in config.github_repos:
         collectors.append(GithubRepoCollector(r.name, r.url, r.parser))
     return collectors

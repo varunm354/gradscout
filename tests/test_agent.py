@@ -69,11 +69,28 @@ def test_should_analyze_only_for_relevant_ambiguous_jobs():
 
 
 def test_irrelevant_ambiguous_job_is_not_sent_to_llm():
+    # "Program Coordinator" has neither a credible target-role signal NOR a
+    # hard nontechnical one (see gradscout.roles.NON_TARGET_TITLE_TOKENS) --
+    # genuinely ambiguous, so it lands in review rather than a hard
+    # ineligible/eligible verdict (unlike e.g. "Recruiter", a Phase 6
+    # review-cleanup addition that is now hard-ineligible, not ambiguous).
     agent = JobAnalysisAgent(FakeProvider(_agent_json()))
-    job = make_job("Recruiter", "3+ years of recruiting experience required.")
+    job = make_job("Program Coordinator", "3+ years of coordination experience required.")
     det = analyze_deterministic(job, CFG)
     assert det.status == EligibilityStatus.review
     assert det.relevant is False
+    assert agent.should_analyze(job, det) is False
+
+
+def test_hard_nontechnical_title_added_in_phase_6_is_ineligible_not_review():
+    """Phase 6 review-digest cleanup: titles like Recruiter/Legal/Finance/... are
+    a HARD override (never merely ambiguous->review), same treatment as the
+    pre-existing sales/marketing tokens -- see gradscout.roles."""
+    agent = JobAnalysisAgent(FakeProvider(_agent_json()))
+    job = make_job("Recruiter", "3+ years of recruiting experience required.")
+    det = analyze_deterministic(job, CFG)
+    assert det.status == EligibilityStatus.ineligible
+    assert det.hard_ineligible is True
     assert agent.should_analyze(job, det) is False
 
 

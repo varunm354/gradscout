@@ -2,8 +2,10 @@
 
 A small, dependable utility that hourly monitors reliable structured job sources for
 **2027 new-grad and eligible early-career technical roles**, prioritizes major tech and
-highly competitive employers, matches each role to the best resume (Backend / AI / Data),
-and alerts to Discord. Deterministic-first; the LLM is optional and bounded.
+highly competitive employers, matches each role to the best resume (Backend / AI / Data)
+using a deterministic, config-driven skill matcher, diversifies alerts and the review
+digest across companies, and alerts to Discord. Deterministic-first; the LLM is optional
+and bounded.
 
 Not a SaaS product. No frontend, no server, no Docker, no auth, no auto-apply, no scraping.
 
@@ -11,7 +13,7 @@ Not a SaaS product. No frontend, no server, no Docker, no auth, no auto-apply, n
 
 ```
 collect -> normalize -> store/dedupe -> eligibility -> prioritize
-        -> resume-select -> notify -> health-report
+        -> resume-select -> diversify -> notify -> health-report
 ```
 
 The deterministic core is fully testable and never depends on the optional LLM.
@@ -43,9 +45,10 @@ python -m scripts.run                # real run (needs DISCORD_WEBHOOK_URL)
 
 ## Configuration
 
-Everything operator-editable lives in `config.yaml` (watchlist, Greenhouse/Lever/Ashby
-boards, GitHub repos, keyword filters, notification thresholds). Secrets are env vars only.
-`company_priority` is data, not code.
+Everything operator-editable lives in `config.yaml` (watchlist, Greenhouse/Lever/Ashby/
+Rippling boards, GitHub repos, keyword filters, notification thresholds, resume-matching
+profiles, per-company diversity caps). Secrets are env vars only. `company_priority` is
+data, not code.
 
 ## Key design decisions (post-review)
 
@@ -79,6 +82,36 @@ boards, GitHub repos, keyword filters, notification thresholds). Secrets are env
    partnerships, sales, biological safety, fellowships, economics, ...) into one, no
    matter how many AI/ML terms appear in the body text. Titles with neither a credible nor
    a nontechnical signal are ambiguous and go to the review digest, never a normal alert.
+9. **Resume-aware matching is deterministic and swappable (Phase 6).** Every eligible/
+   review job is scored against all three resume profiles (`gradscout/resume.py`,
+   `WeightedKeywordResumeMatcher`) using sanitized, purely-technical weighted-term lists
+   defined in `config.yaml` (`resume_profiles`) -- no PII, no LLM call, no network
+   dependency. The recommendation, a saturating 0-100 match score, and a short
+   explanation naming the actual top-weight matched skills (e.g. "Matched FastAPI,
+   PostgreSQL, distributed systems") are shown in every Discord alert and digest row.
+   The matcher is a `Protocol`, so a future embeddings-based engine can be swapped in
+   without touching `analyze.py`, `pipeline.py`, or the DB schema.
+10. **No single company can dominate alerts (Phase 6).** `max_alerts_per_company_per_run`
+    / `max_review_items_per_company_per_run` cap how many items from one company one run
+    selects (`gradscout/diversify.py`), round-robining across AI/Backend/Data
+    recommendation categories first so a prolific poster (e.g. OpenAI) doesn't crowd out
+    every other resume category, let alone every other company. Capped jobs are not lost
+    or endlessly retried: they're marked `AlertState.suppressed` with an explicit
+    `suppressed_company_cap` reason, never resent, and only become reconsiderable again
+    if the underlying job materially changes (existing change-detection re-enqueues it as
+    `pending`).
+11. **The review digest is OFF by default in production (Phase 6.1).**
+    `notifications.send_review_digest: false` is the shipped default because the digest
+    tends to overwhelm the far more useful individual P1/P2/P3 alerts with a large batch
+    of ambiguous roles. This is purely a notification setting: every job is still fully
+    classified and stored with `eligibility_status='review'` in SQLite exactly as before
+    -- nothing about eligibility classification, storage, or the underlying review DB
+    logic/tests is disabled or removed. While off, a review job's alert is simply never
+    enqueued in the first place, so it can never accumulate as pending notification
+    spam; anything already pending from before the setting was flipped is explicitly
+    transitioned to `AlertState.suppressed` (reason `suppressed_review_digest_disabled`)
+    the same auditable way the company-diversity cap works. Set it back to `true` to
+    restore the batched low-priority digest at any time.
 
 ## State persistence (GitHub Actions)
 
@@ -112,10 +145,12 @@ before this change.
 
 ## Status
 
-Phases 0–5 complete. `scripts/collect.py` remains available as a network-only collector
+Phases 0–6 complete. `scripts/collect.py` remains available as a network-only collector
 harness (no alerts, no classification). GradScout can run either locally
 (`python -m scripts.run`, against a local `data/gradscout.db`) or unattended on GitHub
 Actions with durable state on the `state` branch (see above and
 `docs/PHASE_5_HANDOFF.md`). **A production `config.yaml` must still be created and
 committed before the first real scheduled/manual run** -- see `docs/PHASE_5_HANDOFF.md`
-§"First real run".
+§"First real run". See `docs/PHASE_6_HANDOFF.md` for the personalized-job-intelligence
+work (resume-aware matching, company diversity/suppression, expanded startup coverage,
+review-digest cleanup, and the Phase 6.1 UX fix disabling the review digest by default).

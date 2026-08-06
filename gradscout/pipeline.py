@@ -23,6 +23,7 @@ import httpx
 from gradscout import db
 from gradscout.analyze import apply_to_job, classify_job
 from gradscout.collectors.base import Collector, run_collector
+from gradscout.diversify import diversify_by_company
 from gradscout.llm import JobAnalysisAgent
 from gradscout.location import location_permits_alert
 from gradscout.models import (
@@ -37,6 +38,17 @@ from gradscout.normalize import normalize
 from gradscout.notify.discord import MAX_DIGEST_ITEMS, DiscordNotifier
 from gradscout.prioritize import meets_min_priority
 from gradscout.recency import is_recent
+from gradscout.resume import build_matcher_from_config
+
+# Explicit suppression reason recorded on an alert that lost out to a
+# per-company/resume-category diversity cap (see gradscout.diversify).
+SUPPRESSED_COMPANY_CAP = "suppressed_company_cap"
+
+# Explicit suppression reason recorded on a review-priority alert when the
+# operator has disabled the review digest (notifications.send_review_digest:
+# false -- the production default, since the digest tends to overwhelm the
+# far more useful individual P1/P2/P3 alerts). See docs/PHASE_6_HANDOFF.md.
+SUPPRESSED_REVIEW_DIGEST_DISABLED = "suppressed_review_digest_disabled"
 
 logger = logging.getLogger("gradscout.pipeline")
 
@@ -58,6 +70,17 @@ class RunStats:
     # send attempt this run -- see the Phase 5.3 postmortem note on run_once
     # for why this must never be a derived/arithmetic estimate.
     alerts_pending: int = 0
+    # Phase 6: alerts explicitly suppressed this run by the per-company/
+    # resume-category diversity cap (AlertState.suppressed) -- see
+    # gradscout.diversify. Distinct from alerts_pending: these will NOT
+    # resurface next run unless the underlying job materially changes.
+    alerts_suppressed_company_cap: int = 0
+    # Review-digest-disabled UX fix: review-priority alerts explicitly
+    # suppressed because notifications.send_review_digest is false. Normally
+    # 0 every run (new review jobs are simply never enqueued while disabled
+    # -- see _enqueue_if_warranted), nonzero only when cleaning up alerts
+    # that were already pending from before the digest was disabled.
+    alerts_suppressed_review_digest_disabled: int = 0
     review_digest_sent: bool = False
     # Phase 5.3: the review digest may be split across multiple Discord
     # messages (see gradscout.notify.discord._chunk_digest_jobs); these two
@@ -100,6 +123,9 @@ def run_once(
     # ordinary created/changed alerting rules untouched.
     is_baseline_run = not db.is_baseline_complete(conn)
     stats.baseline_run = is_baseline_run
+
+    # Built once per run (not per job) -- see gradscout.resume.
+    resume_matcher = build_matcher_from_config(config)
 
     for collector in collectors:
         # Inspect the PRIOR source-health row before record_source_result()
@@ -161,7 +187,9 @@ def run_once(
                 config.notifications.new_grad_recent_hours,
                 now,
             )
-            resolved = classify_job(job, config, agent, is_recent=recent)
+            resolved = classify_job(
+                job, config, agent, is_recent=recent, resume_matcher=resume_matcher
+            )
             apply_to_job(job, resolved)
             db.apply_classification(conn, upsert_result.job_id, resolved)
             stats.jobs_classified += 1
@@ -171,17 +199,24 @@ def run_once(
             ):
                 stats.alerts_enqueued += 1
 
-    sent, individual_failed = _send_job_alerts(conn, notifier, config)
+    sent, individual_failed, individual_suppressed = _send_job_alerts(conn, notifier, config, now=now)
     stats.alerts_sent += sent
     stats.notification_delivery_failures += individual_failed
+    stats.alerts_suppressed_company_cap += individual_suppressed
 
-    digest_sent, digest_chunks_sent, digest_chunks_failed = _send_review_digest(
-        conn, notifier, config
-    )
+    (
+        digest_sent,
+        digest_chunks_sent,
+        digest_chunks_failed,
+        digest_suppressed,
+        digest_disabled_suppressed,
+    ) = _send_review_digest(conn, notifier, config, now=now)
     stats.review_digest_sent = digest_sent
     stats.review_digest_chunks_sent = digest_chunks_sent
     stats.review_digest_chunks_failed = digest_chunks_failed
     stats.notification_delivery_failures += digest_chunks_failed
+    stats.alerts_suppressed_company_cap += digest_suppressed
+    stats.alerts_suppressed_review_digest_disabled += digest_disabled_suppressed
 
     daily_summary_sent, daily_summary_failed = _maybe_send_daily_summary(conn, notifier, config, now)
     stats.daily_summary_sent = daily_summary_sent
@@ -221,6 +256,8 @@ def run_once(
                 "alerts_enqueued": stats.alerts_enqueued,
                 "alerts_sent": stats.alerts_sent,
                 "alerts_pending": stats.alerts_pending,
+                "alerts_suppressed_company_cap": stats.alerts_suppressed_company_cap,
+                "alerts_suppressed_review_digest_disabled": stats.alerts_suppressed_review_digest_disabled,
                 "review_digest_sent": stats.review_digest_sent,
                 "review_digest_chunks_sent": stats.review_digest_chunks_sent,
                 "review_digest_chunks_failed": stats.review_digest_chunks_failed,
@@ -317,6 +354,15 @@ def _enqueue_if_warranted(
         return False
 
     if resolved.eligibility_status == EligibilityStatus.review:
+        # UX fix: when the operator has disabled the review digest (the
+        # production default -- it tends to overwhelm the far more useful
+        # individual P1/P2/P3 alerts), a review-status job is still fully
+        # classified and stored (eligibility_status='review' on the `jobs`
+        # row is the durable, queryable audit trail), it simply never gets a
+        # pending alert row at all. This means it can never accumulate as
+        # notification spam by construction -- there is nothing to suppress
+        # every run. See _send_review_digest for the one-time cleanup of any
+        # review alert that was already pending from before this was set.
         if not config.notifications.send_review_digest:
             return False
         return db.enqueue_alert(
@@ -333,19 +379,36 @@ def _enqueue_if_warranted(
     return False
 
 
-def _send_job_alerts(conn, notifier: DiscordNotifier, config: Config) -> tuple[int, int]:
+def _send_job_alerts(
+    conn, notifier: DiscordNotifier, config: Config, now: datetime | None = None
+) -> tuple[int, int, int]:
     """Send individual (non-digest) urgent/strong-match alerts, ordered by
-    company priority, up to max_alerts_per_run. Excess and any failed sends
-    stay pending for a later run. Returns (sent, failed) -- ``failed`` counts
-    only genuine rejected/errored delivery attempts (never dry-run or
-    unconfigured-webhook skips, which are not delivery failures)."""
+    company priority, up to max_alerts_per_run. Returns (sent, failed) --
+    ``failed`` counts only genuine rejected/errored delivery attempts (never
+    dry-run or unconfigured-webhook skips, which are not delivery failures).
+
+    Phase 6: before the global cap, ``diversify_by_company`` applies a
+    per-company/resume-category cap so a single prolific poster can never
+    fill every alert slot in a run. Rows it excludes are explicitly
+    transitioned to AlertState.suppressed (see gradscout.db.suppress_alert)
+    rather than left pending -- so they never repeatedly resurface every run,
+    and only become reconsiderable again if the underlying job materially
+    changes (gradscout.db.enqueue_alert). Excess beyond the global cap, and
+    any failed sends, DO simply stay pending for a later run (unchanged
+    Phase 5 behavior)."""
     pending = db.get_pending_alerts(conn, AlertChannel.discord)
     individual = [p for p in pending if p["priority"] in ("p1", "p2", "p3")]
+    selected, suppressed = diversify_by_company(
+        individual, per_company_cap=config.notifications.max_alerts_per_company_per_run
+    )
+    for row in suppressed:
+        db.suppress_alert(conn, row["job_id"], AlertChannel.discord, SUPPRESSED_COMPANY_CAP, now=now)
+
     cap = config.notifications.max_alerts_per_run
     real_attempt = _is_real_attempt(notifier)
     sent = 0
     failed = 0
-    for row in individual[:cap]:
+    for row in selected[:cap]:
         record = db.get_job(conn, row["job_id"])
         if record is None:
             continue
@@ -354,10 +417,12 @@ def _send_job_alerts(conn, notifier: DiscordNotifier, config: Config) -> tuple[i
             sent += 1
         elif real_attempt:
             failed += 1
-    return sent, failed
+    return sent, failed, len(suppressed)
 
 
-def _send_review_digest(conn, notifier: DiscordNotifier, config: Config) -> tuple[bool, int, int]:
+def _send_review_digest(
+    conn, notifier: DiscordNotifier, config: Config, now: datetime | None = None
+) -> tuple[bool, int, int, int, int]:
     """Batch all pending Eligibility Review jobs into one or more digest
     messages (never one message per job), chunked as needed to respect
     Discord's payload limits (see gradscout.notify.discord). Each chunk is
@@ -365,24 +430,61 @@ def _send_review_digest(conn, notifier: DiscordNotifier, config: Config) -> tupl
     specific chunk containing it received a 2xx; every job in a failed or
     unattempted chunk stays pending.
 
-    Returns (fully_sent, chunks_sent, chunks_failed) where fully_sent is True
-    only if at least one chunk was attempted and none of them failed."""
-    if not config.notifications.send_review_digest:
-        return False, 0, 0
+    Phase 6: ``diversify_by_company`` applies a per-company/resume-category
+    cap (``max_review_items_per_company_per_run``) before the existing
+    ``MAX_DIGEST_ITEMS`` slice, so the digest can't be dominated by one
+    company's backlog of ambiguous roles. Excluded rows are explicitly
+    suppressed (see ``_send_job_alerts``) rather than left pending.
+
+    UX fix: when ``notifications.send_review_digest`` is false (the
+    production default -- the digest tends to overwhelm the far more useful
+    individual P1/P2/P3 alerts), the digest is skipped cleanly: no Discord
+    request is made and nothing is marked sent. Eligibility review
+    classification and DB storage are completely unaffected (see
+    gradscout.roles / gradscout.eligibility / the `jobs` table). Any
+    review-priority alert already ``pending`` (e.g. left over from a run
+    before the digest was disabled) is explicitly transitioned to
+    ``AlertState.suppressed`` with reason "suppressed_review_digest_disabled"
+    -- the same auditable mechanism as the company-diversity cap -- so it
+    can never sit as unbounded pending backlog or resurface as a delivery
+    spike if the digest is re-enabled later. Since a NEW review job is never
+    enqueued at all while disabled (see gradscout.pipeline._enqueue_if_warranted),
+    this is normally a one-run cleanup, not an ongoing per-run cost.
+
+    Returns (fully_sent, chunks_sent, chunks_failed, company_cap_suppressed,
+    digest_disabled_suppressed). fully_sent is True only if at least one
+    chunk was attempted and none of them failed."""
     pending = db.get_pending_alerts(conn, AlertChannel.discord)
-    review_rows = [p for p in pending if p["priority"] == "review"][:MAX_DIGEST_ITEMS]
+    review_candidates = [p for p in pending if p["priority"] == "review"]
+
+    if not config.notifications.send_review_digest:
+        for row in review_candidates:
+            db.suppress_alert(
+                conn, row["job_id"], AlertChannel.discord, SUPPRESSED_REVIEW_DIGEST_DISABLED, now=now
+            )
+        return False, 0, 0, 0, len(review_candidates)
+
+    selected, suppressed = diversify_by_company(
+        review_candidates,
+        per_company_cap=config.notifications.max_review_items_per_company_per_run,
+    )
+    for row in suppressed:
+        db.suppress_alert(conn, row["job_id"], AlertChannel.discord, SUPPRESSED_COMPANY_CAP, now=now)
+    suppressed_count = len(suppressed)
+
+    review_rows = selected[:MAX_DIGEST_ITEMS]
     if not review_rows:
-        return False, 0, 0
+        return False, 0, 0, suppressed_count, 0
     records = [r for r in (db.get_job(conn, row["job_id"]) for row in review_rows) if r]
     if not records:
-        return False, 0, 0
+        return False, 0, 0, suppressed_count, 0
     result = notifier.send_review_digest(records)
     delivered_ids = {r.job_id for r in result.delivered}
     for row in review_rows:
         if row["job_id"] in delivered_ids:
             db.mark_alert_sent(conn, row["job_id"], AlertChannel.discord)
     fully_sent = result.chunks_sent > 0 and result.chunks_failed == 0
-    return fully_sent, result.chunks_sent, result.chunks_failed
+    return fully_sent, result.chunks_sent, result.chunks_failed, suppressed_count, 0
 
 
 def _maybe_send_daily_summary(

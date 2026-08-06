@@ -76,6 +76,32 @@ NON_TARGET_TITLE_TOKENS = (
     "fellowships",
     "fellows",
     "economics",
+    # Phase 6 review-digest cleanup: additional hard-nontechnical domains that
+    # should never surface in the ambiguous "review" bucket, even if the
+    # description happens to mention a technical term (e.g. "Legal Counsel,
+    # AI Policy" or "Recruiter, Engineering").
+    "legal",
+    "counsel",
+    "attorney",
+    "procurement",
+    "vendor management",
+    "hr",
+    "human resources",
+    "people operations",
+    "customer success",
+    "business affairs",
+    "workplace",
+    "office coordinator",
+    "facilities",
+    "finance",
+    "accounting",
+    "controller",
+    "bookkeeper",
+    "payroll",
+    "recruiting",
+    "recruiter",
+    "talent acquisition",
+    "sourcer",
 )
 
 # Phrases that establish a credible, title-first signal that a listing is a

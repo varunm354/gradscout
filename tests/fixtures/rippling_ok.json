@@ -1,0 +1,16 @@
+[
+  {
+    "uuid": "r1",
+    "name": "Backend Engineer, New Grad",
+    "department": {"id": "Engineering", "label": "Engineering"},
+    "url": "https://ats.rippling.com/acme/jobs/r1",
+    "workLocation": {"label": "San Francisco, CA", "id": "sf"}
+  },
+  {
+    "uuid": "r2",
+    "name": "Account Executive",
+    "department": {"id": "Sales", "label": "Sales"},
+    "url": "https://ats.rippling.com/acme/jobs/r2",
+    "workLocation": "Remote (United States)"
+  }
+]

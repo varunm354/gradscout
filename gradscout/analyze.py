@@ -35,7 +35,7 @@ from gradscout.prioritize import (
     score_alert_priority,
     score_role_priority,
 )
-from gradscout.resume import recommend_resume
+from gradscout.resume import ResumeMatcher, build_matcher_from_config, recommend_resume
 from gradscout.roles import classify_role
 
 logger = logging.getLogger("gradscout.analyze")
@@ -54,6 +54,7 @@ class DeterministicAnalysis:
     recommended_resume: ResumeVariant | None
     resume_confidence: ResumeConfidence | None
     resume_reason: str | None
+    resume_match_score: int | None
     company_priority: int
     matched_watchlist: str | None
     role_priority: int
@@ -64,12 +65,22 @@ class DeterministicAnalysis:
     remote_alert_penalty: int
 
 
-def analyze_deterministic(job: Job, config: Config, is_recent: bool = True) -> DeterministicAnalysis:
+def analyze_deterministic(
+    job: Job,
+    config: Config,
+    is_recent: bool = True,
+    resume_matcher: ResumeMatcher | None = None,
+) -> DeterministicAnalysis:
+    """``resume_matcher`` should be built ONCE per run via
+    ``build_matcher_from_config`` (see ``gradscout.pipeline.run_once``) and
+    passed down -- it is only built lazily here as a convenience for direct
+    callers/tests that don't already have one."""
     elig = evaluate_eligibility(
         job, config.candidate, max_years=config.notifications.max_years_experience
     )
     roles = classify_role(job)
-    resume = None if elig.status == EligibilityStatus.ineligible else recommend_resume(roles)
+    matcher = resume_matcher or build_matcher_from_config(config)
+    resume = None if elig.status == EligibilityStatus.ineligible else recommend_resume(job, roles, matcher)
     company_priority, matched = resolve_company_priority(job, config)
     role_priority = score_role_priority(elig, roles.relevant)
     alert_priority = score_alert_priority(
@@ -98,6 +109,7 @@ def analyze_deterministic(job: Job, config: Config, is_recent: bool = True) -> D
         recommended_resume=resume.variant if resume else None,
         resume_confidence=resume.confidence if resume else None,
         resume_reason=resume.reason if resume else None,
+        resume_match_score=resume.match_score_pct if resume else None,
         company_priority=company_priority,
         matched_watchlist=matched,
         role_priority=role_priority,
@@ -129,6 +141,7 @@ def resolve(det: DeterministicAnalysis, agent_out: AgentAnalysis | None) -> Reso
             recommended_resume=det.recommended_resume,
             resume_confidence=det.resume_confidence,
             resume_reason=det.resume_reason,
+            resume_match_score=det.resume_match_score,
             role_priority=det.role_priority,
             alert_priority=det.alert_priority,
             llm_used=False,
@@ -155,6 +168,7 @@ def resolve(det: DeterministicAnalysis, agent_out: AgentAnalysis | None) -> Reso
             recommended_resume=det.recommended_resume,
             resume_confidence=det.resume_confidence,
             resume_reason=det.resume_reason,
+            resume_match_score=det.resume_match_score,
             role_priority=det.role_priority,
             alert_priority=AlertPriority.ineligible,
             llm_used=True,
@@ -172,6 +186,9 @@ def resolve(det: DeterministicAnalysis, agent_out: AgentAnalysis | None) -> Reso
     resume = det.recommended_resume or agent_out.recommended_resume
     resume_conf = det.resume_confidence or agent_out.resume_confidence
     resume_reason = det.resume_reason or ("LLM-selected resume" if resume else None)
+    # Only meaningful when the deterministic layer itself produced the resume
+    # pick; an LLM-only pick has no comparable weighted score.
+    resume_match_score = det.resume_match_score if det.recommended_resume else None
     reasons = list(det.reasons) + [f"LLM: {e}" for e in agent_out.evidence]
     alert_priority = score_alert_priority(
         final_status, det.company_priority, det.role_priority, det.relevant,
@@ -192,6 +209,7 @@ def resolve(det: DeterministicAnalysis, agent_out: AgentAnalysis | None) -> Reso
         recommended_resume=resume,
         resume_confidence=resume_conf,
         resume_reason=resume_reason,
+        resume_match_score=resume_match_score,
         role_priority=det.role_priority,
         alert_priority=alert_priority,
         llm_used=True,
@@ -205,9 +223,13 @@ def resolve(det: DeterministicAnalysis, agent_out: AgentAnalysis | None) -> Reso
 
 
 def classify_job(
-    job: Job, config: Config, agent: JobAnalysisAgent | None = None, is_recent: bool = True
+    job: Job,
+    config: Config,
+    agent: JobAnalysisAgent | None = None,
+    is_recent: bool = True,
+    resume_matcher: ResumeMatcher | None = None,
 ) -> ResolvedAnalysis:
-    det = analyze_deterministic(job, config, is_recent)
+    det = analyze_deterministic(job, config, is_recent, resume_matcher=resume_matcher)
     agent_out = agent.analyze(job, det) if agent else None
     return resolve(det, agent_out)
 
@@ -223,6 +245,7 @@ def apply_to_job(job: Job, resolved: ResolvedAnalysis) -> Job:
     job.recommended_resume = resolved.recommended_resume
     job.resume_confidence = resolved.resume_confidence
     job.resume_reason = resolved.resume_reason
+    job.resume_match_score = resolved.resume_match_score
     job.company_priority = resolved.company_priority
     job.alert_priority = resolved.alert_priority
     job.llm_used = resolved.llm_used
@@ -251,13 +274,17 @@ def classify_jobs(
     *,
     is_new_or_changed: Callable[[Job], bool] | None = None,
     is_recent: Callable[[Job], bool] | None = None,
+    resume_matcher: ResumeMatcher | None = None,
 ) -> ClassificationStats:
     """Classify many jobs, applying the LLM only to new/relevant/ambiguous cases.
 
     ``is_new_or_changed`` gates processing entirely (performance: never run over
     the whole 17k feed). ``is_recent`` feeds P1 urgency. Emits the required counts.
+    ``resume_matcher`` should be built once per run (``build_matcher_from_config``)
+    and passed in to avoid rebuilding it per job.
     """
     stats = ClassificationStats()
+    matcher = resume_matcher or build_matcher_from_config(config)
     for job in jobs:
         stats.total += 1
         if is_new_or_changed is not None and not is_new_or_changed(job):
@@ -265,7 +292,7 @@ def classify_jobs(
             continue
 
         recent = is_recent(job) if is_recent else True
-        det = analyze_deterministic(job, config, recent)
+        det = analyze_deterministic(job, config, recent, resume_matcher=matcher)
 
         agent_out = None
         if agent is not None and agent.should_analyze(job, det):

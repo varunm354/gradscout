@@ -7,7 +7,9 @@ from gradscout.collectors.base import CollectorResult, run_collector
 from gradscout.collectors.github_repo import GithubRepoCollector
 from gradscout.collectors.greenhouse import GreenhouseCollector
 from gradscout.collectors.lever import LeverCollector
-from gradscout.models import SourceStatus, SourceType
+from gradscout.collectors.factory import build_collectors
+from gradscout.collectors.rippling import RipplingCollector
+from gradscout.models import Config, RipplingSource, SourceStatus, SourceType
 
 
 # --------------------------------------------------------------------------- #
@@ -17,6 +19,7 @@ def test_source_ids_are_stable_and_distinguishable():
     assert GreenhouseCollector("Acme", "acme").source_id == "greenhouse:acme"
     assert LeverCollector("Acme", "acme").source_id == "lever:acme"
     assert AshbyCollector("Acme", "acme").source_id == "ashby:acme"
+    assert RipplingCollector("Acme", "acme").source_id == "rippling:acme"
     gh = GithubRepoCollector("SimplifyJobs-NewGrad", "http://x")
     assert gh.source_id == "github_repo:SimplifyJobs-NewGrad"
     assert gh.source_type == SourceType.github_repo
@@ -114,6 +117,53 @@ def test_ashby_parse_ok(load_fixture):
     # second uses descriptionHtml -> plain text
     assert "Backend platform work." in rows[1].description_text
     assert "- Go" in rows[1].description_text
+
+
+# --------------------------------------------------------------------------- #
+# Rippling (Phase 6 startup discovery)
+# --------------------------------------------------------------------------- #
+def test_rippling_parse_ok(load_fixture):
+    c = RipplingCollector("Acme", "acme")
+    rows, errors = c.parse(load_fixture("rippling_ok.json"))
+    assert errors == 0
+    assert len(rows) == 2
+    j = rows[0]
+    assert j.source == SourceType.rippling
+    assert j.source_company == "acme"
+    assert j.source_job_id == "r1"
+    assert j.title == "Backend Engineer, New Grad"
+    assert j.apply_url == "https://ats.rippling.com/acme/jobs/r1"
+    assert j.location == "San Francisco, CA"
+    # the list endpoint carries no description/posted-at -- never fabricated
+    assert j.description_text is None
+    assert j.source_posted_at is None
+    # a bare-string workLocation is also accepted
+    assert rows[1].location == "Remote (United States)"
+
+
+def test_rippling_missing_fields_is_partial(load_fixture):
+    c = RipplingCollector("Acme", "acme")
+    c.fetch = lambda client=None: load_fixture("rippling_missing_fields.json")
+    result = run_collector(c, client=None)
+    assert result.status == SourceStatus.partial
+    assert result.jobs_seen == 1     # only the row with a non-empty title
+    assert result.parse_errors == 1
+
+
+def test_rippling_not_a_list_is_error():
+    c = RipplingCollector("Acme", "acme")
+    c.fetch = lambda client=None: {"jobs": []}  # Ashby-shaped, not a Rippling array
+    result = run_collector(c, client=None)
+    assert result.status == SourceStatus.error
+
+
+def test_factory_builds_a_rippling_collector_from_config():
+    config = Config(rippling=[RipplingSource(company="Rippling", board="rippling", company_priority=2)])
+    collectors = build_collectors(config)
+    assert len(collectors) == 1
+    assert isinstance(collectors[0], RipplingCollector)
+    assert collectors[0].source_id == "rippling:rippling"
+    assert collectors[0].company_priority == 2
 
 
 # --------------------------------------------------------------------------- #

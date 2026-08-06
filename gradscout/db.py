@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     recommended_resume TEXT,
     resume_confidence  TEXT,
     resume_reason      TEXT,
+    resume_match_score INTEGER,
     alert_priority     TEXT NOT NULL,
     llm_used           INTEGER NOT NULL DEFAULT 0,
     raw_blob           TEXT NOT NULL DEFAULT '{}',
@@ -110,6 +111,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     state      TEXT NOT NULL,
     created_at TEXT NOT NULL,
     sent_at    TEXT,
+    suppressed_reason TEXT,
+    suppressed_at     TEXT,
     PRIMARY KEY (job_id, channel)
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(channel, state);
@@ -149,6 +152,8 @@ def connect(db_path: str | Path = "data/gradscout.db") -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _ensure_location_columns(conn)
+    _ensure_resume_score_column(conn)
+    _ensure_alert_suppression_columns(conn)
     conn.commit()
 
 
@@ -166,6 +171,27 @@ def _ensure_location_columns(conn: sqlite3.Connection) -> None:
         )
     if "location_reason" not in cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN location_reason TEXT")
+
+
+def _ensure_resume_score_column(conn: sqlite3.Connection) -> None:
+    """Phase 6 migration: add jobs.resume_match_score (0-100, nullable) to a
+    pre-existing ``jobs`` table. Same additive, idempotent pattern as
+    ``_ensure_location_columns``."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "resume_match_score" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN resume_match_score INTEGER")
+
+
+def _ensure_alert_suppression_columns(conn: sqlite3.Connection) -> None:
+    """Phase 6 migration: add alerts.suppressed_reason/suppressed_at to a
+    pre-existing ``alerts`` table, so a company-cap-suppressed alert
+    (AlertState.suppressed) has somewhere to record why/when, without
+    breaking a DB restored from the ``state`` branch that predates it."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)")}
+    if "suppressed_reason" not in cols:
+        conn.execute("ALTER TABLE alerts ADD COLUMN suppressed_reason TEXT")
+    if "suppressed_at" not in cols:
+        conn.execute("ALTER TABLE alerts ADD COLUMN suppressed_at TEXT")
 
 
 # --------------------------------------------------------------------------- #
@@ -235,9 +261,9 @@ def upsert_job(conn: sqlite3.Connection, job: Job, now: datetime | None = None) 
                 description_text, apply_url, source_posted_at, content_hash,
                 first_seen_at, last_seen_at, eligibility_status, eligibility_reasons,
                 role_family, role_priority, employment_type, is_new_grad,
-                recommended_resume, resume_confidence, resume_reason, alert_priority,
-                llm_used, raw_blob, location_classification, location_reason
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                recommended_resume, resume_confidence, resume_reason, resume_match_score,
+                alert_priority, llm_used, raw_blob, location_classification, location_reason
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 job.url_canonical,
@@ -261,6 +287,7 @@ def upsert_job(conn: sqlite3.Connection, job: Job, now: datetime | None = None) 
                 job.recommended_resume.value if job.recommended_resume else None,
                 job.resume_confidence.value if job.resume_confidence else None,
                 job.resume_reason,
+                job.resume_match_score,
                 job.alert_priority.value,
                 int(job.llm_used),
                 json.dumps(job.raw_blob),
@@ -318,7 +345,7 @@ def apply_classification(
         UPDATE jobs SET
             company_priority=?, eligibility_status=?, eligibility_reasons=?,
             role_family=?, role_priority=?, employment_type=?, is_new_grad=?,
-            recommended_resume=?, resume_confidence=?, resume_reason=?,
+            recommended_resume=?, resume_confidence=?, resume_reason=?, resume_match_score=?,
             alert_priority=?, llm_used=?, location_classification=?, location_reason=?
         WHERE job_id=?
         """,
@@ -333,6 +360,7 @@ def apply_classification(
             resolved.recommended_resume.value if resolved.recommended_resume else None,
             resolved.resume_confidence.value if resolved.resume_confidence else None,
             resolved.resume_reason,
+            resolved.resume_match_score,
             resolved.alert_priority.value,
             int(resolved.llm_used),
             resolved.location_classification.value,
@@ -412,6 +440,7 @@ def _row_to_record(conn: sqlite3.Connection, row: sqlite3.Row) -> JobRecord:
         recommended_resume=row["recommended_resume"],
         resume_confidence=row["resume_confidence"],
         resume_reason=row["resume_reason"],
+        resume_match_score=row["resume_match_score"],
         alert_priority=row["alert_priority"],
         llm_used=bool(row["llm_used"]),
         location_classification=row["location_classification"],
@@ -534,33 +563,90 @@ def enqueue_alert(
     priority: str,
     now: datetime | None = None,
 ) -> bool:
-    """Queue an alert as pending. Idempotent: returns False if an alert for this
-    (job, channel) already exists in any state, so we never duplicate."""
+    """Queue an alert as pending.
+
+    Idempotent for ``pending``/``sent`` rows: returns False if an alert for
+    this (job, channel) already exists in either state, so we never
+    duplicate or re-send.
+
+    A row in ``suppressed`` state (Phase 6: lost out to a per-company/
+    resume-category diversity cap -- see gradscout.diversify) is the one
+    exception: it is reset back to ``pending`` (clearing suppressed_reason/
+    suppressed_at). Callers only ever reach this path for created/changed
+    jobs (see gradscout.pipeline._enqueue_if_warranted, gated upstream to
+    skip unchanged jobs), so a suppressed job only ever becomes reconsiderable
+    when its content materially changes -- never merely because it is still
+    sitting in the queue.
+    """
     now = now or _utcnow()
     existing = conn.execute(
-        "SELECT 1 FROM alerts WHERE job_id=? AND channel=?",
+        "SELECT state FROM alerts WHERE job_id=? AND channel=?",
         (job_id, channel.value),
     ).fetchone()
-    if existing:
-        return False
-    conn.execute(
-        "INSERT INTO alerts (job_id, channel, priority, state, created_at, sent_at) "
-        "VALUES (?,?,?,?,?,NULL)",
-        (job_id, channel.value, priority, AlertState.pending.value, now.isoformat()),
+    if existing is None:
+        conn.execute(
+            "INSERT INTO alerts (job_id, channel, priority, state, created_at, sent_at) "
+            "VALUES (?,?,?,?,?,NULL)",
+            (job_id, channel.value, priority, AlertState.pending.value, now.isoformat()),
+        )
+        conn.commit()
+        return True
+    if existing["state"] == AlertState.suppressed.value:
+        conn.execute(
+            """
+            UPDATE alerts SET
+                priority=?, state=?, created_at=?, sent_at=NULL,
+                suppressed_reason=NULL, suppressed_at=NULL
+            WHERE job_id=? AND channel=?
+            """,
+            (priority, AlertState.pending.value, now.isoformat(), job_id, channel.value),
+        )
+        conn.commit()
+        return True
+    return False
+
+
+def suppress_alert(
+    conn: sqlite3.Connection,
+    job_id: int,
+    channel: AlertChannel,
+    reason: str,
+    now: datetime | None = None,
+) -> bool:
+    """Transition a ``pending`` alert to ``suppressed`` with an explicit
+    reason (e.g. "suppressed_company_cap" -- see gradscout.diversify),
+    instead of leaving it pending forever and getting repeatedly
+    re-considered (and looking like unbounded backlog growth) every run.
+    No-op (returns False) if the alert isn't currently pending. See
+    ``enqueue_alert`` for how a materially changed job becomes reconsiderable
+    again."""
+    now = now or _utcnow()
+    cur = conn.execute(
+        """
+        UPDATE alerts SET state=?, suppressed_reason=?, suppressed_at=?
+        WHERE job_id=? AND channel=? AND state=?
+        """,
+        (
+            AlertState.suppressed.value, reason, now.isoformat(),
+            job_id, channel.value, AlertState.pending.value,
+        ),
     )
     conn.commit()
-    return True
+    return cur.rowcount > 0
 
 
 def get_pending_alerts(
     conn: sqlite3.Connection, channel: AlertChannel
 ) -> list[sqlite3.Row]:
     """Pending alerts joined with job context, ordered for prioritized delivery
-    (highest-priority company first, then oldest-queued first)."""
+    (highest-priority company first, then oldest-queued first). Includes
+    ``recommended_resume`` so callers can diversify across AI/Backend/Data
+    within each company (see gradscout.diversify.diversify_by_company)."""
     return conn.execute(
         """
         SELECT a.job_id, a.channel, a.priority, a.created_at,
-               j.company, j.company_priority, j.title, j.apply_url, j.alert_priority
+               j.company, j.company_priority, j.title, j.apply_url, j.alert_priority,
+               j.recommended_resume
         FROM alerts a JOIN jobs j ON j.job_id = a.job_id
         WHERE a.channel=? AND a.state=?
         ORDER BY j.company_priority ASC, a.created_at ASC
