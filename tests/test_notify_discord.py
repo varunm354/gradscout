@@ -161,6 +161,42 @@ def test_job_alert_embed_contains_required_fields():
     assert by_name["Posted"] != by_name["First discovered by GradScout"]
 
 
+def test_job_alert_embed_shows_match_score_and_skills_explanation():
+    """Phase 6: the Recommended resume field names the concrete match score
+    alongside confidence, and the embed description is the skills-based
+    explanation (never just a bare percentage)."""
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    record = make_record(
+        recommended_resume=ResumeVariant.backend,
+        resume_confidence=ResumeConfidence.high,
+        resume_match_score=78,
+        resume_reason="Matched FastAPI, PostgreSQL, distributed systems (backend resume)",
+    )
+    notifier.send_job_alert(record)
+
+    body = json.loads(calls[0].content)
+    embed = body["embeds"][0]
+    by_name = {f["name"]: f["value"] for f in embed["fields"]}
+    assert by_name["Recommended resume"] == "backend (78% match, high confidence)"
+    assert embed["description"] == "Matched FastAPI, PostgreSQL, distributed systems (backend resume)"
+    assert "%" not in embed["description"]  # explanation names skills, not just a score
+
+
+def test_job_alert_embed_omits_score_gracefully_when_absent():
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    record = make_record(resume_match_score=None)
+    notifier.send_job_alert(record)
+
+    body = json.loads(calls[0].content)
+    by_name = {f["name"]: f["value"] for f in body["embeds"][0]["fields"]}
+    assert by_name["Recommended resume"] == "backend (high confidence)"
+    assert "%" not in by_name["Recommended resume"]
+
+
 def test_job_alert_embed_shows_location_fit():
     handler, calls = _capturing()
     client = _client_with(handler)
@@ -218,6 +254,25 @@ def test_review_digest_notes_out_of_region_and_unclear_but_not_preferred():
     assert "Location:" not in values["Acme — Preferred Job"]
     assert "Location: Out of region" in values["Acme — OOR Job"]
     assert "Location: Location unclear" in values["Acme — Unclear Job"]
+
+
+def test_review_digest_field_shows_compact_resume_match_suffix():
+    handler, calls = _capturing()
+    client = _client_with(handler)
+    notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
+    jobs = [
+        make_record(
+            job_id=1, title="Job With Score",
+            recommended_resume=ResumeVariant.ai, resume_match_score=78,
+        ),
+        make_record(job_id=2, title="Job Without Score", resume_match_score=None),
+    ]
+    notifier.send_review_digest(jobs)
+
+    embed = json.loads(calls[0].content)["embeds"][0]
+    values = {f["name"]: f["value"] for f in embed["fields"]}
+    assert values["Acme — Job With Score"].endswith("· ai 78%")
+    assert "%" not in values["Acme — Job Without Score"]
 
 
 def test_empty_review_digest_sends_nothing():

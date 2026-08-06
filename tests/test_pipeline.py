@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 import pytest
+import yaml
 
 from gradscout import db
 from gradscout.collectors.base import Collector
@@ -470,7 +471,11 @@ def test_review_digest_failure_leaves_all_six_alerts_pending_not_lost():
     notification_delivery_failures makes the partial failure explicit in the
     run's own stats -- i.e. this is provably NOT alert loss."""
     conn = _conn_past_baseline()
-    config = _config()
+    # All 6 rows share one (long) company name -- override the Phase 6
+    # per-company review cap so this test keeps isolating Discord payload
+    # chunking/pending-alert bookkeeping; company-diversity behavior itself
+    # is covered separately in tests/test_diversify.py.
+    config = _config(max_review_items_per_company_per_run=100)
     rows = [_review_row(i) for i in range(6)]
     notifier = _notifier(status_code=400)  # simulate the production Discord 400
 
@@ -502,7 +507,7 @@ def test_review_digest_partial_chunk_failure_marks_only_delivered_chunk_sent():
     chunk are marked sent; the rest remain pending, and alerts_pending/
     notification_delivery_failures reflect the partial failure accurately."""
     conn = _conn_past_baseline()
-    config = _config()
+    config = _config(max_review_items_per_company_per_run=100)  # see prior test's note
     rows = [_review_row(i) for i in range(6)]
 
     statuses = iter([204, 400])
@@ -568,7 +573,7 @@ def test_successful_review_digest_marks_alert_sent_exactly_once():
 
 def test_dry_run_review_digest_performs_no_http_calls_and_changes_no_sent_state():
     conn = _conn_past_baseline()
-    config = _config()
+    config = _config(max_review_items_per_company_per_run=100)  # see note above
     rows = [_review_row(i) for i in range(6)]
     calls: list = []
     notifier = _notifier(dry_run=True, calls=calls)
@@ -599,7 +604,7 @@ def test_notification_delivery_failures_visible_alongside_individual_alert_failu
     notification_delivery_failures, never silently as an all-zero, fully
     healthy-looking run."""
     conn = _conn_past_baseline()
-    config = _config()
+    config = _config(max_review_items_per_company_per_run=100)  # see note above
     rows = [
         _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="ok1"),
         *[_review_row(i) for i in range(6)],
@@ -613,6 +618,248 @@ def test_notification_delivery_failures_visible_alongside_individual_alert_failu
     assert stats.notification_delivery_failures >= 2  # the individual alert AND >=1 digest chunk
     assert stats.alerts_pending == len(db.get_pending_alerts(conn, AlertChannel.discord))
     assert stats.alerts_pending == 7
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6: company-diversity cap + explicit suppression (integration).
+# --------------------------------------------------------------------------- #
+def test_company_cap_suppresses_excess_alerts_from_one_company_explicitly():
+    """5 eligible jobs from ONE prolific company (e.g. an OpenAI-style flood)
+    with the default per-company cap of 3: only 3 are sent, and the other 2
+    are explicitly transitioned to AlertState.suppressed (never left
+    pending, never silently dropped) with reason 'suppressed_company_cap'."""
+    conn = _conn_past_baseline()
+    config = _config()  # default max_alerts_per_company_per_run == 3
+    rows = [
+        _row(ELIGIBLE_TITLE, ELIGIBLE_DESC + f" Variant {i}.", job_id=str(i), company="OpenAI")
+        for i in range(5)
+    ]
+    stats = run_once(conn, config, [_collector(rows)], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 5
+    assert stats.alerts_sent == 3
+    assert stats.alerts_suppressed_company_cap == 2
+    assert stats.alerts_pending == 0  # nothing left ambiguously pending
+
+    states = []
+    for i in range(5):
+        rec = db.get_job_by_canonical(conn, f"https://boards.greenhouse.io/acme/jobs/{i}")
+        states.append(db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"])
+    assert states.count(AlertState.sent.value) == 3
+    assert states.count(AlertState.suppressed.value) == 2
+
+    # The suppression reason is explicit/auditable, not merely a status flag.
+    suppressed_reasons = [
+        db.get_alert(conn, db.get_job_by_canonical(conn, f"https://boards.greenhouse.io/acme/jobs/{i}").job_id, AlertChannel.discord)["suppressed_reason"]
+        for i in range(5)
+        if db.get_alert(conn, db.get_job_by_canonical(conn, f"https://boards.greenhouse.io/acme/jobs/{i}").job_id, AlertChannel.discord)["state"] == AlertState.suppressed.value
+    ]
+    assert suppressed_reasons == ["suppressed_company_cap", "suppressed_company_cap"]
+
+
+def test_suppressed_alert_never_resurfaces_on_an_unchanged_rerun():
+    """A suppressed job must NOT come back as pending/spam just because
+    another run happens -- only a material content change can reconsider it
+    (the existing created/changed change-detection gate)."""
+    conn = _conn_past_baseline()
+    config = _config()
+    rows = [
+        _row(ELIGIBLE_TITLE, ELIGIBLE_DESC + f" Variant {i}.", job_id=str(i), company="OpenAI")
+        for i in range(5)
+    ]
+    run_once(conn, config, [_collector(rows)], None, _notifier(), now=NOW)
+
+    later = NOW + timedelta(hours=1)
+    stats2 = run_once(conn, config, [_collector(rows)], None, _notifier(), now=later)
+    assert stats2.jobs_unchanged == 5
+    assert stats2.alerts_enqueued == 0
+    assert stats2.alerts_sent == 0
+    assert stats2.alerts_suppressed_company_cap == 0  # nothing new to (re-)suppress
+    assert stats2.alerts_pending == 0
+
+
+def test_materially_changed_suppressed_job_becomes_reconsiderable():
+    """A suppressed job whose content later materially changes goes back
+    through eligibility/enqueue normally and can be delivered on a later run
+    -- 'only materially changed jobs become eligible again'."""
+    conn = _conn_past_baseline()
+    config = _config()
+    rows = [
+        _row(ELIGIBLE_TITLE, ELIGIBLE_DESC + f" Variant {i}.", job_id=str(i), company="OpenAI")
+        for i in range(5)
+    ]
+    run_once(conn, config, [_collector(rows)], None, _notifier(), now=NOW)
+    suppressed_before = [
+        i for i in range(5)
+        if db.get_alert(
+            conn, db.get_job_by_canonical(conn, f"https://boards.greenhouse.io/acme/jobs/{i}").job_id,
+            AlertChannel.discord,
+        )["state"] == AlertState.suppressed.value
+    ]
+    assert len(suppressed_before) == 2
+    changed_id = suppressed_before[0]
+
+    edited_rows = [
+        _row(ELIGIBLE_TITLE, ELIGIBLE_DESC + f" Variant {changed_id}. Now with Kubernetes.",
+             job_id=str(changed_id), company="OpenAI")
+    ]
+    later = NOW + timedelta(hours=1)
+    stats2 = run_once(conn, config, [_collector(edited_rows)], None, _notifier(), now=later)
+
+    assert stats2.jobs_changed == 1
+    assert stats2.alerts_enqueued == 1  # reconsidered and re-enqueued
+    assert stats2.alerts_sent == 1      # well under cap now (only 1 pending for OpenAI this run)
+
+    rec = db.get_job_by_canonical(conn, f"https://boards.greenhouse.io/acme/jobs/{changed_id}")
+    alert = db.get_alert(conn, rec.job_id, AlertChannel.discord)
+    assert alert["state"] == AlertState.sent.value
+    assert alert["suppressed_reason"] is None
+
+
+def test_review_digest_also_diversifies_and_suppresses_across_companies():
+    """The same per-company cap + explicit suppression applies to the review
+    digest, diversified across companies (not just individual alerts)."""
+    conn = _conn_past_baseline()
+    config = _config()  # default max_review_items_per_company_per_run == 3
+    rows = [
+        _row(REVIEW_TITLE, REVIEW_DESC, job_id=f"r{i}", company="OpenAI") for i in range(5)
+    ] + [
+        _row(REVIEW_TITLE, REVIEW_DESC, job_id="other1", company="Anthropic"),
+    ]
+    stats = run_once(conn, config, [_collector(rows)], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 6
+    assert stats.alerts_suppressed_company_cap == 2  # 5 - 3 from OpenAI; Anthropic's 1 fits
+    assert stats.review_digest_sent is True
+
+    openai_states = [
+        db.get_alert(conn, db.get_job_by_canonical(conn, f"https://boards.greenhouse.io/acme/jobs/r{i}").job_id, AlertChannel.discord)["state"]
+        for i in range(5)
+    ]
+    assert openai_states.count(AlertState.sent.value) == 3
+    assert openai_states.count(AlertState.suppressed.value) == 2
+    anthropic_rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/other1")
+    assert db.get_alert(conn, anthropic_rec.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6.1: review digest disabled by default -- clean skip, no accumulation
+# as pending spam, explicit auditable suppression of anything pre-existing.
+# --------------------------------------------------------------------------- #
+def test_review_digest_disabled_by_default_config_value():
+    """The Pydantic model default is deliberately left True (a large body of
+    pre-existing tests above construct a bare _config()/NotificationConfig()
+    and rely on digest-enabled behavior); it's the shipped config.yaml /
+    config.example.yaml values that actually disable it in production -- see
+    docs/PHASE_6_HANDOFF.md §13."""
+    assert _config().notifications.send_review_digest is True
+
+    for path in ("config.yaml", "config.example.yaml"):
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        assert data["notifications"]["send_review_digest"] is False, path
+
+
+def test_review_status_job_is_never_enqueued_while_digest_disabled():
+    """With the digest disabled, a review-status job is still fully
+    classified and stored, but never gets a pending alert row at all -- so it
+    cannot accumulate as notification spam by construction (requirement 5)."""
+    conn = _conn_past_baseline()
+    config = _config(send_review_digest=False)
+    row = _row(REVIEW_TITLE, REVIEW_DESC, job_id="1")
+
+    stats = run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 0
+    assert stats.alerts_pending == 0
+    assert stats.alerts_suppressed_review_digest_disabled == 0  # nothing to clean up
+
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert rec.eligibility_status.value == "review"  # classification preserved
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord) is None  # no alert row at all
+
+
+def test_review_digest_disabled_cleanly_skips_sending_with_no_http_calls():
+    """Individual alerts still flow normally; the digest step makes zero
+    Discord requests and reports itself as not sent, never as a failure."""
+    conn = _conn_past_baseline()
+    config = _config(send_review_digest=False)
+    calls: list = []
+    notifier = _notifier(calls=calls)
+    rows = [
+        _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1"),
+        *[_review_row(i) for i in range(3)],
+    ]
+    stats = run_once(conn, config, [_collector(rows)], None, notifier, now=NOW)
+
+    assert stats.review_digest_sent is False
+    assert stats.review_digest_chunks_sent == 0
+    assert stats.review_digest_chunks_failed == 0  # a deliberate skip, never a delivery failure
+    assert stats.notification_delivery_failures == 0
+    assert stats.alerts_sent == 1  # only the individual eligible alert
+    assert len(calls) == 1  # exactly one HTTP request: the individual alert, never a digest
+
+
+def test_preexisting_pending_review_alert_is_suppressed_when_digest_later_disabled():
+    """Simulates an existing production DB that already has a review alert
+    pending from before the digest was disabled: it must be explicitly
+    suppressed with a clear, auditable reason -- never left dangling as
+    unbounded pending backlog, and never silently dropped."""
+    conn = _conn_past_baseline()
+    row = _row(REVIEW_TITLE, REVIEW_DESC, job_id="1")
+
+    # First run: digest enabled (default), but Discord delivery fails, so the
+    # review alert is enqueued and stays genuinely `pending` (not `sent`).
+    run_once(
+        conn, _config(), [_collector([row])], None, _notifier(status_code=500), now=NOW
+    )
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"] == AlertState.pending.value
+
+    # Operator disables the digest; next run cleans up the pre-existing
+    # pending review alert instead of leaving it stuck forever.
+    later = NOW + timedelta(hours=1)
+    stats2 = run_once(
+        conn, _config(send_review_digest=False), [], None, _notifier(), now=later
+    )
+
+    assert stats2.alerts_suppressed_review_digest_disabled == 1
+    assert stats2.alerts_pending == 0
+    alert = db.get_alert(conn, rec.job_id, AlertChannel.discord)
+    assert alert["state"] == AlertState.suppressed.value
+    assert alert["suppressed_reason"] == "suppressed_review_digest_disabled"
+
+
+def test_review_digest_still_works_when_explicitly_enabled():
+    """Explicit send_review_digest=True (independent of the Pydantic default)
+    reproduces full pre-6.1 enabled behavior end-to-end."""
+    conn = _conn_past_baseline()
+    config = _config(send_review_digest=True)
+    row = _row(REVIEW_TITLE, REVIEW_DESC, job_id="1")
+
+    stats = run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
+
+    assert stats.review_digest_sent is True
+    assert stats.alerts_suppressed_review_digest_disabled == 0
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
+
+
+def test_individual_alerts_unaffected_by_review_digest_being_disabled():
+    """Requirement 6: individual P1/P2/P3 alerts are completely unchanged by
+    this setting, even in a mixed run alongside several review jobs."""
+    conn = _conn_past_baseline()
+    config = _config(send_review_digest=False)
+    rows = [
+        _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1"),
+        *[_review_row(i) for i in range(5)],
+    ]
+    stats = run_once(conn, config, [_collector(rows)], None, _notifier(), now=NOW)
+
+    assert stats.alerts_sent == 1
+    assert stats.alerts_suppressed_company_cap == 0
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
 
 
 if __name__ == "__main__":

@@ -41,6 +41,20 @@ FALSE_POSITIVE_TITLES = [
     "Data Scientist, Marketing",
     "AI Policy Fellow",
     "Partnerships Associate, AI Solutions",
+    # Phase 6 review-digest cleanup additions.
+    "Legal Counsel, AI Policy",
+    "Corporate Attorney",
+    "Procurement Specialist, AI Vendors",
+    "HR Business Partner, Engineering",
+    "Human Resources Generalist",
+    "Customer Success Manager, AI Platform",
+    "Business Affairs Coordinator",
+    "Workplace Experience Coordinator",
+    "Finance Analyst, Machine Learning Products",
+    "Accounting Manager",
+    "Technical Recruiter, Engineering",
+    "Recruiting Coordinator",
+    "Talent Acquisition Partner, AI",
 ]
 
 

@@ -26,6 +26,7 @@ class SourceType(str, Enum):
     lever = "lever"
     ashby = "ashby"
     github_repo = "github_repo"
+    rippling = "rippling"
 
 
 class EligibilityStatus(str, Enum):
@@ -92,6 +93,12 @@ class AlertChannel(str, Enum):
 class AlertState(str, Enum):
     pending = "pending"
     sent = "sent"
+    # Phase 6: an alert that lost out to a per-company/per-resume-category
+    # diversity cap (see gradscout.diversify). Distinct from "sent" (never
+    # delivered) and from "pending" (would otherwise be reconsidered every
+    # run and could look like unbounded backlog growth for a high-volume
+    # company) -- see gradscout.db.suppress_alert / enqueue_alert.
+    suppressed = "suppressed"
 
 
 class ChangeStatus(str, Enum):
@@ -178,6 +185,7 @@ class Job(BaseModel):
     recommended_resume: ResumeVariant | None = None
     resume_confidence: ResumeConfidence | None = None
     resume_reason: str | None = None
+    resume_match_score: int | None = None  # 0-100, see gradscout.resume
 
     alert_priority: AlertPriority = AlertPriority.unclassified
     llm_used: bool = False
@@ -220,6 +228,7 @@ class JobRecord(BaseModel):
     recommended_resume: ResumeVariant | None
     resume_confidence: ResumeConfidence | None
     resume_reason: str | None
+    resume_match_score: int | None = None
     alert_priority: AlertPriority
     llm_used: bool
     location_classification: LocationClassification
@@ -293,6 +302,42 @@ class GithubRepoSource(BaseModel):
     parser: str = "generic_md"
 
 
+class RipplingSource(BaseModel):
+    """Rippling ATS (companies using Rippling's own applicant-tracking product,
+    e.g. Rippling itself) -- official public JSON API at ats.rippling.com, a
+    distinct platform from Greenhouse/Lever/Ashby. See
+    gradscout.collectors.rippling."""
+
+    company: str
+    board: str
+    company_priority: int = 3
+
+
+class WeightedTerm(BaseModel):
+    """One weighted skill/technology term for resume-profile matching (Phase 6).
+
+    ``term`` is matched case-insensitively with word-boundary awareness (see
+    gradscout.textmatch) against a job's title + description; ``weight``
+    controls its contribution to that resume variant's score. ``display`` is
+    an optional human-readable form used only in Discord explanations (e.g.
+    term="llm", display="LLMs") -- purely cosmetic, never affects matching.
+    """
+
+    term: str
+    weight: int = 1
+    display: str | None = None
+
+
+class ResumeProfileConfig(BaseModel):
+    """A sanitized, purely-technical weighted-term profile for one resume
+    variant. Contains NO personal information (no name/contact/education) --
+    only skills, tools, technologies, and technical experience areas drawn
+    from the candidate's resumes. Data, not code: editable in config.yaml
+    without any code change. See gradscout.resume.WeightedKeywordResumeMatcher."""
+
+    terms: list[WeightedTerm] = Field(default_factory=list)
+
+
 class WatchlistCompany(BaseModel):
     name: str
     company_priority: int = 1
@@ -307,6 +352,12 @@ class NotificationConfig(BaseModel):
     daily_summary_hour_utc: int = 13
     new_grad_recent_hours: int = 48
     max_years_experience: int = 5
+    # --- Company diversity (Phase 6) ---
+    # Caps how many individual alerts / review-digest items from the SAME
+    # company one run may select, so a single prolific poster (e.g. OpenAI)
+    # can never dominate every alert/digest. See gradscout.diversify.
+    max_alerts_per_company_per_run: int = 3
+    max_review_items_per_company_per_run: int = 3
 
 
 class Config(BaseModel):
@@ -315,10 +366,17 @@ class Config(BaseModel):
     greenhouse: list[GreenhouseSource] = Field(default_factory=list)
     lever: list[LeverSource] = Field(default_factory=list)
     ashby: list[AshbySource] = Field(default_factory=list)
+    rippling: list[RipplingSource] = Field(default_factory=list)
     github_repos: list[GithubRepoSource] = Field(default_factory=list)
     include_keywords: list[str] = Field(default_factory=list)
     exclude_keywords: list[str] = Field(default_factory=list)
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
+    # --- Resume-aware matching (Phase 6) ---
+    # Sanitized, purely-technical weighted-term profiles per resume variant.
+    # See gradscout.resume.WeightedKeywordResumeMatcher. Defaults to empty
+    # (falls back to the pre-Phase-6 role-family-only mapping) so existing
+    # configs/tests that never set this keep working unaffected.
+    resume_profiles: dict[ResumeVariant, ResumeProfileConfig] = Field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +416,7 @@ class ResolvedAnalysis(BaseModel):
     recommended_resume: ResumeVariant | None
     resume_confidence: ResumeConfidence | None
     resume_reason: str | None
+    resume_match_score: int | None = None
     company_priority: int
     role_priority: int
     alert_priority: AlertPriority

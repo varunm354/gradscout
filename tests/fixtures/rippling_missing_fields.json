@@ -1,0 +1,13 @@
+[
+  {
+    "uuid": "r1",
+    "name": "Backend Engineer, New Grad",
+    "url": "https://ats.rippling.com/acme/jobs/r1",
+    "workLocation": {"label": "San Francisco, CA"}
+  },
+  {
+    "uuid": "r2",
+    "name": "",
+    "url": "https://ats.rippling.com/acme/jobs/r2"
+  }
+]

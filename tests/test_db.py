@@ -13,6 +13,7 @@ from gradscout.models import (
     Job,
     LocationClassification,
     ResolvedAnalysis,
+    ResumeVariant,
     RoleFamily,
     SourceStatus,
     SourceType,
@@ -357,6 +358,158 @@ def test_mark_sent_is_noop_when_not_pending(conn):
     jid = db.upsert_job(conn, job).job_id
     # nothing enqueued yet
     assert db.mark_alert_sent(conn, jid, AlertChannel.discord) is False
+
+
+def test_pending_alerts_includes_recommended_resume_for_diversification(conn):
+    """Phase 6: get_pending_alerts must surface recommended_resume so callers
+    can diversify across AI/Backend/Data (see gradscout.diversify)."""
+    job = make_job(
+        source=SourceType.greenhouse, source_company="acme", source_job_id="1",
+        apply_url="https://boards.greenhouse.io/acme/jobs/1",
+    )
+    jid = db.upsert_job(conn, job).job_id
+    db.apply_classification(conn, jid, _resolved(recommended_resume=ResumeVariant.ai))
+    db.enqueue_alert(conn, jid, AlertChannel.discord, "p1")
+    pending = db.get_pending_alerts(conn, AlertChannel.discord)
+    assert pending[0]["recommended_resume"] == "ai"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6: alert suppression (company-diversity cap) -- pending -> suppressed,
+# and reconsideration only via a materially-changed re-enqueue.
+# --------------------------------------------------------------------------- #
+def test_suppress_alert_transitions_pending_to_suppressed_with_reason(conn):
+    job = make_job(
+        source=SourceType.greenhouse, source_company="acme", source_job_id="1",
+        apply_url="https://boards.greenhouse.io/acme/jobs/1",
+    )
+    jid = db.upsert_job(conn, job).job_id
+    db.enqueue_alert(conn, jid, AlertChannel.discord, "p2")
+
+    assert db.suppress_alert(conn, jid, AlertChannel.discord, "suppressed_company_cap") is True
+    alert = db.get_alert(conn, jid, AlertChannel.discord)
+    assert alert["state"] == AlertState.suppressed.value
+    assert alert["suppressed_reason"] == "suppressed_company_cap"
+    assert alert["suppressed_at"] is not None
+    # Suppressed alerts are NOT pending -- they must never resurface every run.
+    assert db.get_pending_alerts(conn, AlertChannel.discord) == []
+
+
+def test_suppress_alert_is_noop_if_not_currently_pending(conn):
+    job = make_job(
+        source=SourceType.greenhouse, source_company="acme", source_job_id="1",
+        apply_url="https://boards.greenhouse.io/acme/jobs/1",
+    )
+    jid = db.upsert_job(conn, job).job_id
+    # Never enqueued at all.
+    assert db.suppress_alert(conn, jid, AlertChannel.discord, "suppressed_company_cap") is False
+
+    db.enqueue_alert(conn, jid, AlertChannel.discord, "p2")
+    db.mark_alert_sent(conn, jid, AlertChannel.discord)
+    # Already sent -- suppressing a delivered alert makes no sense and must be a no-op.
+    assert db.suppress_alert(conn, jid, AlertChannel.discord, "suppressed_company_cap") is False
+    assert db.get_alert(conn, jid, AlertChannel.discord)["state"] == AlertState.sent.value
+
+
+def test_enqueue_alert_does_not_resurrect_a_suppressed_alert_without_reenqueue(conn):
+    """A suppressed alert must NOT simply reappear as pending on its own --
+    only an explicit enqueue_alert call (which the pipeline only makes for a
+    created/changed job) can reconsider it."""
+    job = make_job(
+        source=SourceType.greenhouse, source_company="acme", source_job_id="1",
+        apply_url="https://boards.greenhouse.io/acme/jobs/1",
+    )
+    jid = db.upsert_job(conn, job).job_id
+    db.enqueue_alert(conn, jid, AlertChannel.discord, "p2")
+    db.suppress_alert(conn, jid, AlertChannel.discord, "suppressed_company_cap")
+    assert db.get_pending_alerts(conn, AlertChannel.discord) == []
+
+
+def test_enqueue_alert_resets_a_suppressed_alert_to_pending():
+    """The reconsideration path: gradscout.pipeline only ever calls
+    enqueue_alert for a created/changed job (never unchanged), so this reset
+    is exactly 'only materially changed jobs become eligible again'."""
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+    job = make_job(
+        source=SourceType.greenhouse, source_company="acme", source_job_id="1",
+        apply_url="https://boards.greenhouse.io/acme/jobs/1",
+    )
+    jid = db.upsert_job(conn, job).job_id
+    db.enqueue_alert(conn, jid, AlertChannel.discord, "p2")
+    db.suppress_alert(conn, jid, AlertChannel.discord, "suppressed_company_cap")
+
+    assert db.enqueue_alert(conn, jid, AlertChannel.discord, "p1") is True
+    alert = db.get_alert(conn, jid, AlertChannel.discord)
+    assert alert["state"] == AlertState.pending.value
+    assert alert["priority"] == "p1"
+    assert alert["suppressed_reason"] is None
+    assert alert["suppressed_at"] is None
+    pending = db.get_pending_alerts(conn, AlertChannel.discord)
+    assert [p["job_id"] for p in pending] == [jid]
+    conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6: resume_match_score / alerts-suppression schema migrations.
+# --------------------------------------------------------------------------- #
+_PRE_PHASE_6_ALERTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS alerts (
+    job_id     INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    channel    TEXT NOT NULL,
+    priority   TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    sent_at    TEXT,
+    PRIMARY KEY (job_id, channel)
+);
+"""
+
+
+def test_legacy_alerts_table_without_suppression_columns_is_migrated():
+    """A DB restored from the 'state' branch before Phase 6 has no
+    suppressed_reason/suppressed_at columns. init_db() must add them via
+    ALTER TABLE without error, and suppress_alert must then work normally."""
+    conn = db.connect(":memory:")
+    conn.executescript(_PRE_PHASE_6_ALERTS_SCHEMA)
+    conn.commit()
+    cols_before = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)")}
+    assert "suppressed_reason" not in cols_before
+
+    db.init_db(conn)
+    cols_after = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)")}
+    assert {"suppressed_reason", "suppressed_at"} <= cols_after
+
+    job = make_job(
+        source=SourceType.greenhouse, source_company="acme", source_job_id="1",
+        apply_url="https://boards.greenhouse.io/acme/jobs/1",
+    )
+    jid = db.upsert_job(conn, job).job_id
+    db.enqueue_alert(conn, jid, AlertChannel.discord, "p2")
+    assert db.suppress_alert(conn, jid, AlertChannel.discord, "suppressed_company_cap") is True
+    conn.close()
+
+
+def test_legacy_jobs_table_without_resume_match_score_is_migrated():
+    conn = db.connect(":memory:")
+    conn.executescript(_PRE_LOCATION_JOBS_SCHEMA)
+    conn.commit()
+    cols_before = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    assert "resume_match_score" not in cols_before
+
+    db.init_db(conn)
+    cols_after = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    assert "resume_match_score" in cols_after
+
+    job = make_job(
+        source=SourceType.greenhouse, source_company="acme", source_job_id="1",
+        apply_url="https://boards.greenhouse.io/acme/jobs/1",
+    )
+    jid = db.upsert_job(conn, job).job_id
+    assert db.get_job(conn, jid).resume_match_score is None
+    db.apply_classification(conn, jid, _resolved(resume_match_score=78))
+    assert db.get_job(conn, jid).resume_match_score == 78
+    conn.close()
 
 
 def test_pending_alerts_ordered_by_company_priority(conn):

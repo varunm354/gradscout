@@ -1,12 +1,16 @@
 # GradScout PRODUCTION configuration.
 # Generated from the approved 25-company watchlist proposal (see chat history /
-# docs/PHASE_5_HANDOFF.md §9.3). Contains NO secrets -- safe to commit to `main`.
+# docs/PHASE_5_HANDOFF.md §9.3), extended in Phase 6 with resume-aware
+# matching, company-diversity caps, and expanded startup coverage, then
+# refined in Phase 6.1 to disable the review digest by default (see
+# docs/PHASE_6_HANDOFF.md). Contains NO secrets -- safe to commit to `main`.
 #
-# Direct Greenhouse/Lever/Ashby sources below were live-verified against the
-# real public board APIs immediately before this file was written (job counts
-# observed, not guessed). Companies without a verified direct source are kept
-# on the watchlist for company_priority matching, but rely on indirect
-# coverage via the Simplify GitHub feed -- see the `github_repos` section.
+# Direct Greenhouse/Lever/Ashby/Rippling sources below were live-verified
+# against the real public board APIs immediately before this file was written
+# (job counts observed, not guessed). Companies without a verified direct
+# source are kept on the watchlist for company_priority matching, but rely on
+# indirect coverage via the Simplify GitHub feed -- see the `github_repos`
+# section.
 
 candidate:
   graduation_year: 2027
@@ -24,6 +28,82 @@ candidate:
   allow_us_remote: true              # a clearly U.S.-remote job is acceptable anywhere in the U.S.
   location_required_for_alert: true  # gate normal alerts on location fit (never on eligibility)
   remote_alert_priority_penalty: 1   # priority ranks to downgrade a remote_acceptable job by
+
+# --- Resume-aware matching (Phase 6) ---
+# Sanitized, purely-technical weighted-term profiles for the three resume
+# variants -- NO personal information (no name/contact/education/dates), only
+# skills/tools/technologies/technical-experience areas. Every eligible/review
+# job is scored against ALL THREE profiles (see gradscout/resume.py); the
+# highest-scoring variant is recommended, and the top matched terms (by
+# weight) become the human-readable explanation shown in every Discord alert.
+# Editable here without any code change -- same philosophy as `watchlist`.
+resume_profiles:
+  ai:
+    terms:
+      - {term: llm, weight: 3, display: LLMs}
+      - {term: large language model, weight: 3, display: LLMs}
+      - {term: embeddings, weight: 3}
+      - {term: embedding, weight: 3, display: Embeddings}
+      - {term: rag, weight: 3, display: RAG}
+      - {term: retrieval augmented generation, weight: 3, display: RAG}
+      - {term: vector database, weight: 3}
+      - {term: vector search, weight: 3}
+      - {term: pgvector, weight: 2}
+      - {term: applied ml, weight: 3, display: Applied ML}
+      - {term: applied machine learning, weight: 3, display: Applied ML}
+      - {term: machine learning, weight: 2}
+      - {term: pytorch, weight: 2, display: PyTorch}
+      - {term: tensorflow, weight: 2, display: TensorFlow}
+      - {term: scikit-learn, weight: 2, display: scikit-learn}
+      - {term: semantic search, weight: 3}
+      - {term: semantic ranking, weight: 3}
+      - {term: ai observability, weight: 3}
+      - {term: model validation, weight: 2}
+      - {term: model integration, weight: 2}
+      - {term: nlp, weight: 2, display: NLP}
+      - {term: generative ai, weight: 2, display: Generative AI}
+      - {term: pandas, weight: 1, display: pandas}
+      - {term: numpy, weight: 1, display: NumPy}
+  backend:
+    terms:
+      - {term: rest api, weight: 2, display: REST APIs}
+      - {term: rest apis, weight: 2, display: REST APIs}
+      - {term: restful api, weight: 2, display: REST APIs}
+      - {term: distributed systems, weight: 3}
+      - {term: fastapi, weight: 3, display: FastAPI}
+      - {term: flask, weight: 2, display: Flask}
+      - {term: database design, weight: 2}
+      - {term: asynchronous, weight: 2}
+      - {term: async, weight: 1, display: Async}
+      - {term: system architecture, weight: 2}
+      - {term: microservices, weight: 3}
+      - {term: postgresql, weight: 3, display: PostgreSQL}
+      - {term: postgres, weight: 2, display: Postgres}
+      - {term: database indexing, weight: 2}
+      - {term: worker pipeline, weight: 2}
+      - {term: worker pipelines, weight: 2}
+      - {term: backend schema, weight: 2}
+      - {term: backend schemas, weight: 2}
+      - {term: api, weight: 1, display: API}
+  data:
+    terms:
+      - {term: etl, weight: 3, display: ETL}
+      - {term: etl pipeline, weight: 3, display: ETL pipelines}
+      - {term: etl pipelines, weight: 3, display: ETL pipelines}
+      - {term: data modeling, weight: 3}
+      - {term: sql optimization, weight: 3}
+      - {term: sql, weight: 1, display: SQL}
+      - {term: data warehousing, weight: 3}
+      - {term: data warehouse, weight: 3}
+      - {term: analytics, weight: 2}
+      - {term: dashboarding, weight: 2}
+      - {term: dashboard, weight: 1, display: Dashboards}
+      - {term: pandas, weight: 1, display: pandas}
+      - {term: numpy, weight: 1, display: NumPy}
+      - {term: tableau, weight: 3, display: Tableau}
+      - {term: deduplication, weight: 2}
+      - {term: change detection, weight: 2}
+      - {term: data normalization, weight: 2}
 
 # High-priority companies. company_priority: 1 = highest.
 # coverage_status is DERIVED at runtime (not set here):
@@ -119,6 +199,83 @@ watchlist:
     company_priority: 2
     aliases: [samsara]
 
+  # --- Phase 6: established startups (roughly 10 - several thousand
+  # employees), direct ATS coverage live-verified immediately before this
+  # file was written (see gradscout/collectors + the greenhouse/lever/ashby/
+  # rippling sections below for exact slugs and job counts observed).
+  - name: Tekion
+    company_priority: 2
+    aliases: [tekion]
+  - name: Glean
+    company_priority: 2
+    aliases: [glean, gleanwork]
+  - name: Zoox
+    company_priority: 2
+    aliases: [zoox]
+  - name: Rippling
+    company_priority: 2
+    aliases: [rippling]
+  - name: Applied Intuition
+    company_priority: 2
+    # No verified direct board (boards-api.greenhouse.io 404s despite a
+    # public Greenhouse-hosted careers page) -- indirect (Simplify) only.
+    aliases: [applied intuition]
+  - name: Nuro
+    company_priority: 2
+    aliases: [nuro]
+  - name: Crusoe
+    company_priority: 2
+    aliases: [crusoe, crusoe energy]
+  - name: Together AI
+    company_priority: 2
+    aliases: [together ai, togetherai]
+  - name: Decagon
+    company_priority: 2
+    aliases: [decagon]
+  - name: Harvey
+    company_priority: 2
+    aliases: [harvey]
+  - name: Anysphere
+    company_priority: 2
+    aliases: [anysphere, cursor]
+  - name: Runway
+    company_priority: 2
+    aliases: [runway, runwayml]
+
+  # --- Phase 6: Bay Area growth-stage infra / developer-tool companies,
+  # same live-verification standard. ---
+  - name: Confluent
+    company_priority: 2
+    aliases: [confluent]
+  - name: Cockroach Labs
+    company_priority: 2
+    aliases: [cockroach labs, cockroachdb, cockroachlabs]
+  - name: Pinecone
+    company_priority: 2
+    aliases: [pinecone]
+  - name: Weights & Biases
+    company_priority: 2
+    # Checked against Greenhouse/Lever/Ashby under every plausible slug;
+    # none resolved to a real board -- indirect (Simplify) only, same
+    # honesty standard as Applied Intuition (never guess a token).
+    aliases: [weights and biases, weights & biases, wandb]
+  - name: Baseten
+    company_priority: 2
+    aliases: [baseten]
+  - name: Modal
+    company_priority: 2
+    aliases: [modal, modal labs]
+  - name: Vercel
+    company_priority: 2
+    aliases: [vercel]
+  - name: Render
+    company_priority: 2
+    aliases: [render]
+  - name: Fly.io
+    company_priority: 2
+    # Same as Weights & Biases: checked, not guessed, no verified board found.
+    aliases: [fly.io, fly io, flyio]
+
 # Native ATS sources. Configuring one here gives a watchlist company "direct"
 # coverage. Every entry below was live-verified (HTTP 200 + a real jobs array)
 # against the official public board API immediately before this file was
@@ -171,10 +328,33 @@ greenhouse:
   - company: Samsara
     board: samsara
     company_priority: 2
+  # --- Phase 6 startups (Greenhouse) ---
+  - company: Tekion
+    board: tekion
+    company_priority: 2
+  - company: Glean
+    board: gleanwork
+    company_priority: 2
+  - company: Nuro
+    board: nuro
+    company_priority: 2
+  - company: Together AI
+    board: togetherai
+    company_priority: 2
+  - company: Cockroach Labs
+    board: cockroachlabs
+    company_priority: 2
+  - company: Vercel
+    board: vercel
+    company_priority: 2
 
 lever:
   - company: Palantir
     board: palantir
+    company_priority: 2
+  # --- Phase 6 startups (Lever) ---
+  - company: Zoox
+    board: zoox
     company_priority: 2
 
 ashby:
@@ -186,6 +366,44 @@ ashby:
     company_priority: 2
   - company: Cohere
     board: cohere
+    company_priority: 2
+  # --- Phase 6 startups (Ashby) ---
+  - company: Crusoe
+    board: crusoe
+    company_priority: 2
+  - company: Decagon
+    board: decagon
+    company_priority: 2
+  - company: Harvey
+    board: harvey
+    company_priority: 2
+  - company: Runway
+    board: runway
+    company_priority: 2
+  - company: Anysphere
+    board: cursor
+    company_priority: 2
+  - company: Confluent
+    board: confluent
+    company_priority: 2
+  - company: Pinecone
+    board: pinecone
+    company_priority: 2
+  - company: Baseten
+    board: baseten
+    company_priority: 2
+  - company: Modal
+    board: modal
+    company_priority: 2
+  - company: Render
+    board: render
+    company_priority: 2
+
+# Rippling ATS (companies using Rippling's own applicant-tracking product --
+# a distinct platform from Greenhouse/Lever/Ashby; see gradscout/collectors/rippling.py).
+rippling:
+  - company: Rippling
+    board: rippling
     company_priority: 2
 
 # GitHub new-grad repositories. These provide INDIRECT coverage only.
@@ -214,9 +432,31 @@ exclude_keywords: [senior, staff, principal, director, manager, lead, architect,
 
 notifications:
   discord_min_priority: p3          # p1 | p2 | p3 : minimum priority to alert immediately
-  send_review_digest: true          # send Eligibility Review jobs in a separate low-priority section
+  # --- Review digest (Phase 6.1 UX fix) ---
+  # DISABLED by default in production: the digest tends to overwhelm the far
+  # more useful individual P1/P2/P3 alerts with a large batch of ambiguous
+  # roles. Eligibility review classification and SQLite storage are
+  # completely unaffected by this setting (see gradscout/eligibility.py,
+  # gradscout/roles.py) -- every job is still classified `review` and stored
+  # normally; this only governs whether a review-priority Discord message is
+  # ever queued/sent. While disabled, a review job's alert is simply never
+  # enqueued (so it cannot accumulate as pending notification spam); any
+  # alert already pending from before this was set is explicitly suppressed
+  # with reason "suppressed_review_digest_disabled" -- the same auditable
+  # mechanism as the company-diversity cap below. Flip to `true` to restore
+  # the batched low-priority digest.
+  send_review_digest: false
   max_alerts_per_run: 25            # cap PER RUN; unsent jobs stay pending and are delivered later
   send_healthy_reports: false       # do NOT send hourly healthy summaries
   daily_summary_hour_utc: 13        # send one daily success summary at this UTC hour
   new_grad_recent_hours: 48         # "recently discovered" window for p1 urgency
   max_years_experience: 3           # >= this many required years => ineligible (unless softened)
+  # --- Company diversity (Phase 6) ---
+  # Caps how many individual alerts / review-digest items from the SAME
+  # company one run may select, so a single prolific poster (e.g. OpenAI)
+  # can never dominate every alert/digest -- see gradscout/diversify.py.
+  # Company-cap-suppressed jobs are marked AlertState.suppressed (reason
+  # "suppressed_company_cap"), never resent every run, and only become
+  # reconsiderable again if the underlying job materially changes.
+  max_alerts_per_company_per_run: 3
+  max_review_items_per_company_per_run: 3
