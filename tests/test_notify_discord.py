@@ -133,8 +133,9 @@ def test_job_alert_embed_contains_required_fields():
     handler, calls = _capturing()
     client = _client_with(handler)
     notifier = DiscordNotifier(webhook_url="https://discord.test/hook", client=client)
-    record = make_record()
-    notifier.send_job_alert(record)
+    record = make_record()  # source_posted_at = 2027-01-01T00:00:00Z
+    now = datetime(2027, 1, 1, 2, 15, tzinfo=timezone.utc)  # 2h15m later
+    notifier.send_job_alert(record, now=now)
 
     body = json.loads(calls[0].content)
     embed = body["embeds"][0]
@@ -155,8 +156,10 @@ def test_job_alert_embed_contains_required_fields():
     assert by_name["Priority"] == "P1"
     assert by_name["Eligibility"] == "eligible"
     assert "high confidence" in by_name["Recommended resume"]
-    # posted date and first-discovered time must never be conflated
-    assert by_name["Posted"] == record.source_posted_at.isoformat()
+    # Phase 6.2: "Posted" is a human-readable relative age, never the raw ISO
+    # timestamp -- posted date and first-discovered time must never be
+    # conflated (they use entirely different formats/values here).
+    assert by_name["Posted"] == "2h ago"
     assert by_name["First discovered by GradScout"] == record.first_seen_at.isoformat()
     assert by_name["Posted"] != by_name["First discovered by GradScout"]
 

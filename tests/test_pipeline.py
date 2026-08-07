@@ -22,6 +22,7 @@ from gradscout.llm import JobAnalysisAgent, NullProvider
 from gradscout.models import (
     AlertChannel,
     AlertState,
+    CandidateProfile,
     Config,
     NotificationConfig,
     RawJob,
@@ -89,9 +90,10 @@ def _row(
     )
 
 
-def _config(**notif_overrides) -> Config:
+def _config(candidate: CandidateProfile | None = None, **notif_overrides) -> Config:
     notifications = NotificationConfig(**notif_overrides)
     return Config(
+        candidate=candidate or CandidateProfile(),
         watchlist=[WatchlistCompany(name="Acme", company_priority=1)],
         notifications=notifications,
     )
@@ -860,6 +862,245 @@ def test_individual_alerts_unaffected_by_review_digest_being_disabled():
     assert stats.alerts_suppressed_company_cap == 0
     rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
     assert db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6.2: fresh-first alert window -- individual (p1/p2/p3) alerts only
+# fire for jobs whose SOURCE-provided posted_at is within a rolling window,
+# so newly onboarded sources never dump their historical backlog as if it
+# were fresh. See gradscout.freshness / docs/PHASE_6_HANDOFF.md.
+# --------------------------------------------------------------------------- #
+def test_job_posted_inside_window_alerts():
+    conn = _conn_past_baseline()
+    db.set_last_successful_run_at(conn, now=NOW - timedelta(hours=1))
+    config = _config()  # alert_overlap_minutes=60 -> window_start = NOW - 2h
+    row = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=NOW - timedelta(minutes=30))
+    stats = run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 1
+    assert stats.alerts_sent == 1
+
+
+def test_job_posted_outside_window_does_not_alert():
+    """The job is still fully classified and stored -- it simply never gets
+    an individual Discord alert (requirement 7)."""
+    conn = _conn_past_baseline()
+    db.set_last_successful_run_at(conn, now=NOW - timedelta(hours=1))
+    config = _config()  # window_start = (NOW - 1h) - 60m = NOW - 2h
+    row = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=NOW - timedelta(hours=3))
+    stats = run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 0
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert rec.eligibility_status.value == "eligible"  # classification/storage unaffected
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord) is None
+
+
+def test_job_just_inside_overlap_buffer_boundary_still_alerts():
+    """The overlap buffer exists precisely to prevent a job right at the
+    boundary from being missed by schedule drift or ATS timestamp delay."""
+    conn = _conn_past_baseline()
+    last_run = NOW - timedelta(hours=1)
+    db.set_last_successful_run_at(conn, now=last_run)
+    config = _config()  # alert_overlap_minutes=60
+    window_start = last_run - timedelta(minutes=60)
+    row = _row(
+        ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=window_start + timedelta(seconds=1)
+    )
+    stats = run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 1
+    assert stats.alerts_sent == 1
+
+
+def test_overlap_does_not_resend_an_already_sent_alert():
+    """Existing dedupe (never the freshness gate) is what prevents a
+    duplicate send of the SAME unchanged job re-seen well within the
+    overlap window on a later run."""
+    conn = _conn_past_baseline()
+    config = _config()
+    row = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=NOW)
+    stats1 = run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
+    assert stats1.alerts_sent == 1
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
+
+    later = NOW + timedelta(minutes=30)
+    calls: list = []
+    stats2 = run_once(conn, config, [_collector([row])], None, _notifier(calls=calls), now=later)
+
+    assert stats2.jobs_unchanged == 1
+    assert stats2.alerts_enqueued == 0
+    assert stats2.alerts_sent == 0
+    assert len(calls) == 0
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
+
+
+def test_recovery_mode_uses_only_last_recovery_max_age_hours():
+    """No recorded last successful run (a freshly baselined DB, or one that
+    has never completed an ordinary run) -> recovery mode: only the last
+    ``recovery_max_age_hours`` (default 24) is considered, never the full
+    historical inventory (requirement 6)."""
+    conn = _conn_past_baseline()  # baseline complete, but no last_successful_run_at recorded
+    assert db.get_last_successful_run_at(conn) is None
+    config = _config()  # recovery_max_age_hours=24
+    rows = [
+        _row(
+            ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", company="Within Recovery",
+            posted_at=NOW - timedelta(hours=10),
+        ),
+        _row(
+            ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="2", company="Outside Recovery",
+            posted_at=NOW - timedelta(hours=30),
+        ),
+    ]
+    stats = run_once(conn, config, [_collector(rows)], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 1
+    assert stats.alerts_sent == 1
+    within = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    outside = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/2")
+    assert db.get_alert(conn, within.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
+    assert db.get_alert(conn, outside.job_id, AlertChannel.discord) is None
+
+
+def test_first_seen_at_today_does_not_make_old_source_posted_at_fresh():
+    """Freshness is judged STRICTLY by source_posted_at -- a job GradScout
+    only discovered today, but which the source posted long ago, must not
+    be treated as fresh just because first_seen_at is recent."""
+    conn = _conn_past_baseline()
+    db.set_last_successful_run_at(conn, now=NOW - timedelta(minutes=30))
+    config = _config()
+    row = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=NOW - timedelta(days=10))
+    stats = run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 0
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert rec.first_seen_at == NOW  # discovered "today"
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord) is None
+
+
+def test_missing_source_posted_at_never_alerts():
+    """Fails safe: a job with no source-provided posted date is fully
+    classified and stored, but never individually alerted."""
+    conn = _conn_past_baseline()
+    db.set_last_successful_run_at(conn, now=NOW - timedelta(minutes=30))
+    config = _config()
+    row = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=None)
+    stats = run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 0
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert rec.eligibility_status.value == "eligible"
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord) is None
+
+
+def test_far_future_source_posted_at_never_alerts():
+    """Gap 2: a "posted" date far beyond the clock-skew tolerance (bad ATS
+    timestamp, or real clock skew) must not be treated as trivially
+    freshest-possible."""
+    conn = _conn_past_baseline()
+    db.set_last_successful_run_at(conn, now=NOW - timedelta(minutes=30))
+    config = _config()  # alert_clock_skew_minutes=15
+    row = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=NOW + timedelta(hours=6))
+    stats = run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 0
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord) is None
+
+
+def test_slightly_future_source_posted_at_within_skew_alerts():
+    """Gap 2: a "posted" date only slightly ahead of now (ordinary clock
+    skew, well within tolerance) is accepted and alerts normally."""
+    conn = _conn_past_baseline()
+    db.set_last_successful_run_at(conn, now=NOW - timedelta(minutes=30))
+    config = _config()  # alert_clock_skew_minutes=15
+    row = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=NOW + timedelta(minutes=5))
+    stats = run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
+
+    assert stats.alerts_enqueued == 1
+    assert stats.alerts_sent == 1
+
+
+def test_individual_alerts_sent_newest_posted_first_across_companies():
+    """Individual alerts are sorted newest-to-oldest BEFORE company
+    diversification and the global cap are applied (requirement 2)."""
+    conn = _conn_past_baseline()
+    config = _config()
+    rows = [
+        _row(
+            ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", company="Oldest Co",
+            posted_at=NOW - timedelta(hours=2),
+        ),
+        _row(
+            ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="2", company="Newest Co",
+            posted_at=NOW - timedelta(minutes=10),
+        ),
+        _row(
+            ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="3", company="Middle Co",
+            posted_at=NOW - timedelta(minutes=30),
+        ),
+    ]
+    calls: list = []
+    notifier = _notifier(calls=calls)
+    stats = run_once(conn, config, [_collector(rows)], None, notifier, now=NOW)
+
+    assert stats.alerts_sent == 3
+    companies_in_send_order = [
+        json.loads(c.content)["embeds"][0]["fields"][0]["value"] for c in calls  # "Company" is fields[0]
+    ]
+    assert companies_in_send_order == ["Newest Co", "Middle Co", "Oldest Co"]
+
+
+def test_preexisting_pending_alert_suppressed_once_it_ages_outside_the_window():
+    """Gap 1: freshness is re-checked against every PENDING individual
+    alert, not just newly enqueued ones -- an alert stuck pending across
+    repeated delivery failures (or one left over from before Phase 6.2) is
+    explicitly suppressed, never eventually delivered stale."""
+    conn = _conn_past_baseline()
+    config = _config()
+    row = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=NOW)
+    run_once(conn, config, [_collector([row])], None, _notifier(status_code=500), now=NOW)
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"] == AlertState.pending.value
+
+    # A long gap (monitor down/failing well beyond recovery_max_age_hours)
+    # triggers recovery mode on the next run, anchored to THIS run's own
+    # "now" rather than the stale last_successful_run_at -- the stuck
+    # pending alert's posted_at is now well before even that fixed window.
+    much_later = NOW + timedelta(hours=30)
+    stats2 = run_once(conn, config, [], None, _notifier(), now=much_later)
+
+    assert stats2.alerts_sent == 0
+    assert stats2.alerts_suppressed_freshness == 1
+    alert = db.get_alert(conn, rec.job_id, AlertChannel.discord)
+    assert alert["state"] == AlertState.suppressed.value
+    assert alert["suppressed_reason"] == "suppressed_outside_freshness_window"
+
+
+def test_preexisting_pending_alert_with_missing_posted_at_is_suppressed():
+    """Gap 1: simulates a legacy pending alert whose job's posted_at was
+    never reliably backfilled -- suppressed with a specific auditable
+    reason, never merely dropped from consideration and left pending."""
+    conn = _conn_past_baseline()
+    config = _config()
+    row = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=NOW)
+    run_once(conn, config, [_collector([row])], None, _notifier(status_code=500), now=NOW)
+    rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"] == AlertState.pending.value
+
+    conn.execute("UPDATE jobs SET source_posted_at=NULL WHERE job_id=?", (rec.job_id,))
+    conn.commit()
+
+    later = NOW + timedelta(minutes=30)
+    stats2 = run_once(conn, config, [], None, _notifier(), now=later)
+
+    assert stats2.alerts_sent == 0
+    assert stats2.alerts_suppressed_freshness == 1
+    alert = db.get_alert(conn, rec.job_id, AlertChannel.discord)
+    assert alert["state"] == AlertState.suppressed.value
+    assert alert["suppressed_reason"] == "suppressed_missing_posted_at"
 
 
 if __name__ == "__main__":

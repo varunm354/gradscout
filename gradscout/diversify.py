@@ -44,8 +44,17 @@ def _category_of(row: Any, resume_key: str) -> str:
 def _select_diverse(items: list[Any], cap: int, resume_key: str) -> list[Any]:
     """Rank a single company's candidate rows internally (most urgent first),
     then round-robin across resume categories, taking at most one per
-    category per round, until ``cap`` is reached or candidates are exhausted."""
-    ranked = sorted(items, key=lambda r: (_priority_rank(r), r["created_at"]))
+    category per round, until ``cap`` is reached or candidates are exhausted.
+
+    Ranks by priority only and relies on Python's stable sort to preserve
+    ``items``' own relative order as the tiebreak for equal-priority rows --
+    which is exactly ``created_at`` ascending for the review digest (the
+    order gradscout.db.get_pending_alerts already returns), and newest
+    ``source_posted_at`` first for individual alerts (see
+    gradscout.pipeline._send_job_alerts, Phase 6.2), so within-company
+    selection prefers the freshest job at a given priority without this
+    function needing to know which ordering convention its caller used."""
+    ranked = sorted(items, key=_priority_rank)
     queues: dict[str, list[Any]] = {c: [] for c in _CATEGORY_ORDER}
     for row in ranked:
         queues[_category_of(row, resume_key)].append(row)
