@@ -554,6 +554,27 @@ def mark_baseline_complete(conn: sqlite3.Connection, now: datetime | None = None
 
 
 # --------------------------------------------------------------------------- #
+# Fresh-first alert window (Phase 6.2): the durable anchor for the rolling
+# overlap window (see gradscout.freshness.compute_alert_window_start). Written
+# ONLY at the true successful end of run_once -- never if collection,
+# classification, persistence, or delivery processing raised -- so a failed
+# run leaves the next run's window computed from the last GENUINELY successful
+# run, not silently advanced. See gradscout.pipeline.run_once.
+# --------------------------------------------------------------------------- #
+LAST_SUCCESSFUL_RUN_AT_META_KEY = "last_successful_run_at"
+
+
+def get_last_successful_run_at(conn: sqlite3.Connection) -> datetime | None:
+    value = get_meta(conn, LAST_SUCCESSFUL_RUN_AT_META_KEY)
+    return datetime.fromisoformat(value) if value else None
+
+
+def set_last_successful_run_at(conn: sqlite3.Connection, now: datetime | None = None) -> None:
+    now = now or _utcnow()
+    set_meta(conn, LAST_SUCCESSFUL_RUN_AT_META_KEY, now.isoformat())
+
+
+# --------------------------------------------------------------------------- #
 # Alerts (pending -> sent)
 # --------------------------------------------------------------------------- #
 def enqueue_alert(
@@ -641,12 +662,15 @@ def get_pending_alerts(
     """Pending alerts joined with job context, ordered for prioritized delivery
     (highest-priority company first, then oldest-queued first). Includes
     ``recommended_resume`` so callers can diversify across AI/Backend/Data
-    within each company (see gradscout.diversify.diversify_by_company)."""
+    within each company (see gradscout.diversify.diversify_by_company), and
+    ``source_posted_at`` (Phase 6.2) so callers can re-validate freshness and
+    sort newest-first before delivery (see gradscout.pipeline._send_job_alerts
+    / gradscout.freshness)."""
     return conn.execute(
         """
         SELECT a.job_id, a.channel, a.priority, a.created_at,
                j.company, j.company_priority, j.title, j.apply_url, j.alert_priority,
-               j.recommended_resume
+               j.recommended_resume, j.source_posted_at
         FROM alerts a JOIN jobs j ON j.job_id = a.job_id
         WHERE a.channel=? AND a.state=?
         ORDER BY j.company_priority ASC, a.created_at ASC

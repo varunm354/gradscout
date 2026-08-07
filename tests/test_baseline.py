@@ -170,14 +170,20 @@ def test_materially_changed_job_after_baseline_follows_normal_alert_rule():
 
     assert stats2.baseline_run is False
     assert stats2.jobs_changed == 1
-    # Still not recent (posted_at unchanged) -> p2, but p2 meets the default
-    # discord_min_priority (p2) under the ORDINARY (non-baseline) rule, so a
-    # materially edited existing job is enqueued individually post-baseline.
-    assert stats2.alerts_enqueued == 1
-    assert stats2.alerts_sent == 1
+    # Still not recent (posted_at unchanged) -> p2, which meets the default
+    # discord_min_priority (p2) under the ORDINARY (non-baseline) eligibility/
+    # priority/location rule -- but posted_at is OLD (30 days before the
+    # baseline run), and Phase 6.2's fresh-first alert window now gates
+    # individual alerts on top of that: the baseline run set
+    # last_successful_run_at=NOW, so this run's window starts at
+    # NOW - alert_overlap_minutes (default 60m), well after OLD. A
+    # materially edited but still-30-days-stale job therefore correctly
+    # never gets an individual alert post-baseline (see gradscout.freshness).
+    assert stats2.alerts_enqueued == 0
+    assert stats2.alerts_sent == 0
     rec = db.get_job_by_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1")
     assert rec.alert_priority.value == "p2"
-    assert db.get_alert(conn, rec.job_id, AlertChannel.discord)["state"] == AlertState.sent.value
+    assert db.get_alert(conn, rec.job_id, AlertChannel.discord) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -197,6 +203,35 @@ def test_failed_first_run_does_not_mark_baseline_complete(monkeypatch):
         run_once(conn, config, [_collector([row])], None, _notifier(), now=NOW)
 
     assert db.is_baseline_complete(conn) is False
+    # Phase 6.2 gap 3: a failed run must never advance the fresh-first alert
+    # window's anchor either -- it stays at its pre-run value (None here,
+    # since this was the very first run) so the next attempt's window is
+    # computed from the last GENUINELY successful run, not silently from a
+    # run that never actually finished delivering.
+    assert db.get_last_successful_run_at(conn) is None
+
+
+def test_failed_run_after_a_prior_success_leaves_last_successful_run_at_unchanged(monkeypatch):
+    """Phase 6.2 gap 3: unlike the very-first-run case above, this proves a
+    LATER failure doesn't merely leave the anchor at None -- it leaves it at
+    the PRIOR successful run's own timestamp, not the failed run's ``now``."""
+    conn = _conn()
+    config = _config()
+    first = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="1", posted_at=NOW)
+    run_once(conn, config, [_collector([first])], None, _notifier(), now=NOW)  # succeeds (baseline)
+    assert db.get_last_successful_run_at(conn) == NOW
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated failure on a later run")
+
+    monkeypatch.setattr(db, "apply_classification", boom)
+    later = NOW + timedelta(hours=1)
+    second = _row(ELIGIBLE_TITLE, ELIGIBLE_DESC, job_id="2", posted_at=later)
+    with pytest.raises(RuntimeError, match="simulated failure on a later run"):
+        run_once(conn, config, [_collector([second])], None, _notifier(), now=later)
+
+    # Still the FIRST run's timestamp -- the failed second run never advanced it.
+    assert db.get_last_successful_run_at(conn) == NOW
 
 
 # --------------------------------------------------------------------------- #
@@ -218,6 +253,9 @@ def test_dry_run_first_run_does_not_mark_baseline_complete():
     assert stats.baseline_completed is False
     assert db.is_baseline_complete(conn) is False
     assert calls == []
+    # A dry-run must never advance the fresh-first alert window's anchor
+    # either, since no real delivery happened (Phase 6.2).
+    assert db.get_last_successful_run_at(conn) is None
 
     # A subsequent real (non-dry) run must still be treated as baseline,
     # since the dry-run never durably completed it.
@@ -226,6 +264,7 @@ def test_dry_run_first_run_does_not_mark_baseline_complete():
     assert stats2.baseline_run is True
     assert stats2.baseline_completed is True
     assert db.is_baseline_complete(conn) is True
+    assert db.get_last_successful_run_at(conn) == later
 
 
 # --------------------------------------------------------------------------- #

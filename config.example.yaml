@@ -17,6 +17,13 @@ candidate:
   allow_us_remote: true              # a clearly U.S.-remote job is acceptable anywhere in the U.S.
   location_required_for_alert: true  # gate normal alerts on location fit (never on eligibility)
   remote_alert_priority_penalty: 1   # priority ranks to downgrade a remote_acceptable job by
+  # --- Fresh-first alert window (Phase 6.2) ---
+  # Individual (p1/p2/p3) alerts only fire for jobs whose SOURCE-provided
+  # posted_at is within a rolling window ending at "now", so newly onboarded
+  # sources never dump their historical backlog as if it were fresh.
+  alert_overlap_minutes: 60      # window's lower bound = last successful run time minus this
+  recovery_max_age_hours: 24     # used instead, if there's no/too-old a last successful run
+  alert_clock_skew_minutes: 15   # a "posted" date further in the future than this is suppressed
 
 # --- Resume-aware matching (Phase 6) ---
 # Sanitized, purely-technical weighted-term profiles per resume variant -- NO

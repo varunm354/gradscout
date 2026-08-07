@@ -24,6 +24,7 @@ from gradscout import db
 from gradscout.analyze import apply_to_job, classify_job
 from gradscout.collectors.base import Collector, run_collector
 from gradscout.diversify import diversify_by_company
+from gradscout.freshness import FreshnessOutcome, compute_alert_window_start, evaluate_freshness
 from gradscout.llm import JobAnalysisAgent
 from gradscout.location import location_permits_alert
 from gradscout.models import (
@@ -50,6 +51,15 @@ SUPPRESSED_COMPANY_CAP = "suppressed_company_cap"
 # far more useful individual P1/P2/P3 alerts). See docs/PHASE_6_HANDOFF.md.
 SUPPRESSED_REVIEW_DIGEST_DISABLED = "suppressed_review_digest_disabled"
 
+# Phase 6.2 fresh-first alert window: explicit suppression reasons recorded on
+# an individual (p1/p2/p3) alert that fails the freshness re-check performed
+# immediately before delivery -- see _send_job_alerts and gradscout.freshness.
+# Reusing FreshnessOutcome's own string values keeps exactly one source of
+# truth for these reason strings.
+SUPPRESSED_MISSING_POSTED_AT = FreshnessOutcome.suppressed_missing_posted_at.value
+SUPPRESSED_INVALID_POSTED_AT = FreshnessOutcome.suppressed_invalid_posted_at.value
+SUPPRESSED_OUTSIDE_FRESHNESS_WINDOW = FreshnessOutcome.suppressed_outside_freshness_window.value
+
 logger = logging.getLogger("gradscout.pipeline")
 
 
@@ -75,6 +85,14 @@ class RunStats:
     # gradscout.diversify. Distinct from alerts_pending: these will NOT
     # resurface next run unless the underlying job materially changes.
     alerts_suppressed_company_cap: int = 0
+    # Phase 6.2: individual (p1/p2/p3) alerts explicitly suppressed by the
+    # fresh-first freshness re-check performed immediately before delivery --
+    # see _send_job_alerts / gradscout.freshness.evaluate_freshness. Covers a
+    # job whose source_posted_at fell outside the rolling alert window (too
+    # old, or suspiciously far in the future), was missing, or was
+    # unparsable. Like alerts_suppressed_company_cap, these will NOT resurface
+    # next run unless the underlying job materially changes.
+    alerts_suppressed_freshness: int = 0
     # Review-digest-disabled UX fix: review-priority alerts explicitly
     # suppressed because notifications.send_review_digest is false. Normally
     # 0 every run (new review jobs are simply never enqueued while disabled
@@ -123,6 +141,17 @@ def run_once(
     # ordinary created/changed alerting rules untouched.
     is_baseline_run = not db.is_baseline_complete(conn)
     stats.baseline_run = is_baseline_run
+
+    # Fresh-first alert window (Phase 6.2): read the PRIOR successful run's
+    # timestamp before this run can possibly write a new one (see the
+    # last_successful_run_at write at the very end of this function, and
+    # gradscout.freshness). None during baseline -- freshness gating never
+    # applies to the baseline bootstrap run, exactly like the existing
+    # location/priority gates below.
+    last_successful_run_at = db.get_last_successful_run_at(conn)
+    alert_window_start = (
+        None if is_baseline_run else compute_alert_window_start(last_successful_run_at, config, now)
+    )
 
     # Built once per run (not per job) -- see gradscout.resume.
     resume_matcher = build_matcher_from_config(config)
@@ -195,14 +224,24 @@ def run_once(
             stats.jobs_classified += 1
 
             if _enqueue_if_warranted(
-                conn, upsert_result.job_id, resolved, config, now, is_baseline_run=is_baseline_run
+                conn,
+                upsert_result.job_id,
+                resolved,
+                config,
+                now,
+                is_baseline_run=is_baseline_run,
+                source_posted_at=job.source_posted_at,
+                alert_window_start=alert_window_start,
             ):
                 stats.alerts_enqueued += 1
 
-    sent, individual_failed, individual_suppressed = _send_job_alerts(conn, notifier, config, now=now)
+    sent, individual_failed, individual_suppressed_cap, individual_suppressed_freshness = (
+        _send_job_alerts(conn, notifier, config, now=now, alert_window_start=alert_window_start)
+    )
     stats.alerts_sent += sent
     stats.notification_delivery_failures += individual_failed
-    stats.alerts_suppressed_company_cap += individual_suppressed
+    stats.alerts_suppressed_company_cap += individual_suppressed_cap
+    stats.alerts_suppressed_freshness += individual_suppressed_freshness
 
     (
         digest_sent,
@@ -229,6 +268,21 @@ def run_once(
     # left pending by a failed digest chunk, making a real partial-delivery
     # failure look like a fully clean, empty run.
     stats.alerts_pending = len(db.get_pending_alerts(conn, AlertChannel.discord))
+
+    # Phase 6.2: advance the fresh-first alert window's anchor only now that
+    # every step above (collect, normalize, classify, persist, enqueue,
+    # deliver) has run without raising -- an exception anywhere earlier in
+    # this function propagates out of run_once and this line is simply never
+    # reached, so a failed run leaves last_successful_run_at at whatever it
+    # was before this run (None, or the last GENUINELY successful run's
+    # timestamp), and the next run's window is computed accordingly rather
+    # than silently advancing past jobs this run never actually delivered. A
+    # dry-run must never advance this anchor either, since no real delivery
+    # happened. Written for BOTH baseline and ordinary runs, so the very
+    # first post-baseline run has a real anchor instead of falling into
+    # recovery mode.
+    if not notifier.dry_run:
+        db.set_last_successful_run_at(conn, now=now)
 
     # Mark the baseline complete only now that every step above (collect,
     # normalize, classify, persist, enqueue, deliver) has run without
@@ -257,6 +311,7 @@ def run_once(
                 "alerts_sent": stats.alerts_sent,
                 "alerts_pending": stats.alerts_pending,
                 "alerts_suppressed_company_cap": stats.alerts_suppressed_company_cap,
+                "alerts_suppressed_freshness": stats.alerts_suppressed_freshness,
                 "alerts_suppressed_review_digest_disabled": stats.alerts_suppressed_review_digest_disabled,
                 "review_digest_sent": stats.review_digest_sent,
                 "review_digest_chunks_sent": stats.review_digest_chunks_sent,
@@ -318,7 +373,15 @@ def _notify_source_transition(
 
 
 def _enqueue_if_warranted(
-    conn, job_id: int, resolved, config: Config, now: datetime, *, is_baseline_run: bool = False
+    conn,
+    job_id: int,
+    resolved,
+    config: Config,
+    now: datetime,
+    *,
+    is_baseline_run: bool = False,
+    source_posted_at: datetime | None = None,
+    alert_window_start: datetime | None = None,
 ) -> bool:
     """Only enqueue for a job that's newly created or materially changed in a
     way relevant to eligibility/role/priority/resume/requirements -- which is
@@ -340,6 +403,13 @@ def _enqueue_if_warranted(
     digest path just below -- a review-status job always reaches the digest
     regardless of location, and an eligible-but-out_of_region/unclear job is
     simply stored and never alerted at all (not even to the digest).
+
+    Phase 6.2: the plain-eligible (non-baseline, non-review) branch is
+    additionally gated by the fresh-first alert window (``alert_window_start``,
+    None during baseline -- see run_once/gradscout.freshness). A job whose
+    source_posted_at is missing, unparsable, or outside the window is simply
+    never enqueued here (there is no pending row yet to suppress); see
+    _send_job_alerts for the symmetric re-check of already-pending alerts.
     """
     if is_baseline_run:
         if (
@@ -372,6 +442,10 @@ def _enqueue_if_warranted(
         resolved.eligibility_status == EligibilityStatus.eligible
         and meets_min_priority(resolved.alert_priority, config.notifications.discord_min_priority)
         and location_permits_alert(resolved.location_classification, config.candidate)
+        and evaluate_freshness(
+            source_posted_at, alert_window_start, now, config.candidate.alert_clock_skew_minutes
+        )
+        == FreshnessOutcome.fresh
     ):
         return db.enqueue_alert(
             conn, job_id, AlertChannel.discord, resolved.alert_priority.value, now=now
@@ -379,13 +453,45 @@ def _enqueue_if_warranted(
     return False
 
 
+def _posted_at_sort_key(raw: str | None) -> datetime:
+    """Parse a raw ``source_posted_at`` DB value (ISO string or None) for
+    newest-first sorting. Treats missing/unparsable values as the oldest
+    possible -- defensive only, since by the point this is called in
+    _send_job_alerts every row has already passed the freshness recheck
+    (which requires a valid, parseable date)."""
+    if raw is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def _send_job_alerts(
-    conn, notifier: DiscordNotifier, config: Config, now: datetime | None = None
-) -> tuple[int, int, int]:
-    """Send individual (non-digest) urgent/strong-match alerts, ordered by
-    company priority, up to max_alerts_per_run. Returns (sent, failed) --
-    ``failed`` counts only genuine rejected/errored delivery attempts (never
-    dry-run or unconfigured-webhook skips, which are not delivery failures).
+    conn,
+    notifier: DiscordNotifier,
+    config: Config,
+    now: datetime | None = None,
+    alert_window_start: datetime | None = None,
+) -> tuple[int, int, int, int]:
+    """Send individual (non-digest) urgent/strong-match alerts, newest-posted
+    first, up to max_alerts_per_run. Returns (sent, failed,
+    suppressed_company_cap, suppressed_freshness) -- ``failed`` counts only
+    genuine rejected/errored delivery attempts (never dry-run or
+    unconfigured-webhook skips, which are not delivery failures).
+
+    Phase 6.2: before anything else, every PENDING individual alert (not just
+    ones enqueued this run) is re-validated against the fresh-first alert
+    window (see gradscout.freshness.evaluate_freshness) -- covers both an
+    alert that was already pending before this feature shipped, and one that
+    aged out of the window while stuck pending across repeated delivery
+    failures. Anything that fails is explicitly transitioned to
+    AlertState.suppressed with a specific auditable reason
+    (suppressed_missing_posted_at / suppressed_invalid_posted_at /
+    suppressed_outside_freshness_window) -- never merely dropped from this
+    in-memory list and left pending. The survivors are then sorted
+    newest-posted-first.
 
     Phase 6: before the global cap, ``diversify_by_company`` applies a
     per-company/resume-category cap so a single prolific poster can never
@@ -396,10 +502,29 @@ def _send_job_alerts(
     changes (gradscout.db.enqueue_alert). Excess beyond the global cap, and
     any failed sends, DO simply stay pending for a later run (unchanged
     Phase 5 behavior)."""
+    now = now or datetime.now(timezone.utc)
     pending = db.get_pending_alerts(conn, AlertChannel.discord)
     individual = [p for p in pending if p["priority"] in ("p1", "p2", "p3")]
+
+    fresh: list = []
+    suppressed_freshness = 0
+    for row in individual:
+        outcome = evaluate_freshness(
+            row["source_posted_at"], alert_window_start, now, config.candidate.alert_clock_skew_minutes
+        )
+        if outcome == FreshnessOutcome.fresh:
+            fresh.append(row)
+        else:
+            db.suppress_alert(conn, row["job_id"], AlertChannel.discord, outcome.value, now=now)
+            suppressed_freshness += 1
+
+    # Newest-posted-first -- diversify_by_company's stable-sort tiebreak (see
+    # gradscout.diversify._select_diverse) and the selected[:cap] slice below
+    # both rely on this input order to prefer the freshest jobs.
+    fresh.sort(key=lambda r: _posted_at_sort_key(r["source_posted_at"]), reverse=True)
+
     selected, suppressed = diversify_by_company(
-        individual, per_company_cap=config.notifications.max_alerts_per_company_per_run
+        fresh, per_company_cap=config.notifications.max_alerts_per_company_per_run
     )
     for row in suppressed:
         db.suppress_alert(conn, row["job_id"], AlertChannel.discord, SUPPRESSED_COMPANY_CAP, now=now)
@@ -412,12 +537,12 @@ def _send_job_alerts(
         record = db.get_job(conn, row["job_id"])
         if record is None:
             continue
-        if notifier.send_job_alert(record):
+        if notifier.send_job_alert(record, now=now):
             db.mark_alert_sent(conn, row["job_id"], AlertChannel.discord)
             sent += 1
         elif real_attempt:
             failed += 1
-    return sent, failed, len(suppressed)
+    return sent, failed, len(suppressed), suppressed_freshness
 
 
 def _send_review_digest(

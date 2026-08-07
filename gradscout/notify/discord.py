@@ -47,9 +47,11 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import httpx
 
+from gradscout.freshness import format_posting_age
 from gradscout.location import location_label
 from gradscout.models import AlertPriority, JobRecord, LocationClassification
 
@@ -142,7 +144,7 @@ def _field(name: str, value: str, *, inline: bool = True) -> dict:
     }
 
 
-def _job_embed(job: JobRecord) -> dict:
+def _job_embed(job: JobRecord, now: datetime) -> dict:
     fields = [
         _field("Company", job.company),
         _field("Priority", job.alert_priority.value.upper()),
@@ -165,8 +167,12 @@ def _job_embed(job: JobRecord) -> dict:
     fields.append(_field("Recommended resume", resume_value))
 
     # Never describe first_seen_at as a posting date: label the two distinctly.
-    if job.source_posted_at:
-        fields.append(_field("Posted", job.source_posted_at.isoformat()))
+    # Phase 6.2: human-readable relative age (e.g. "45m ago", "Jul 28") only --
+    # the exact source_posted_at timestamp is preserved internally (DB,
+    # JobRecord) for sorting/tests/debugging, but is no longer shown raw here.
+    posting_age = format_posting_age(job.source_posted_at, now)
+    if posting_age:
+        fields.append(_field("Posted", posting_age))
     fields.append(_field("First discovered by GradScout", job.first_seen_at.isoformat()))
 
     reason = job.resume_reason or (job.eligibility_reasons[0] if job.eligibility_reasons else "")
@@ -373,8 +379,9 @@ class DiscordNotifier:
         )
         return False
 
-    def send_job_alert(self, job: JobRecord) -> bool:
-        return self._post({"embeds": [_job_embed(job)]})
+    def send_job_alert(self, job: JobRecord, now: datetime | None = None) -> bool:
+        now = now or datetime.now(timezone.utc)
+        return self._post({"embeds": [_job_embed(job, now)]})
 
     def send_review_digest(self, jobs: list[JobRecord]) -> BatchSendResult:
         """Send all ``jobs`` as one or more digest messages, chunked to

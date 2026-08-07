@@ -277,6 +277,21 @@ class CandidateProfile(BaseModel):
     # is a weaker match than an onsite/hybrid Bay Area role.
     remote_alert_priority_penalty: int = 1
 
+    # --- fresh-first alert window (Phase 6.2) ---
+    # Only alert on jobs posted within this rolling window (source clock
+    # only -- never first_seen_at), so newly onboarded sources don't dump
+    # their historical backlog as "fresh" alerts. See gradscout.freshness.
+    alert_overlap_minutes: int = 60
+    # If there is no recorded last successful run, or it was longer ago than
+    # this, fall back to a recovery window of the last N hours instead of
+    # alerting the full historical inventory.
+    recovery_max_age_hours: int = 24
+    # A job "posted" more than this far in the future (bad ATS timestamp, or
+    # ordinary clock skew) is never individually alerted, even though it
+    # would otherwise satisfy the lower window bound. A timestamp within
+    # tolerance is harmless and simply displays as "just now".
+    alert_clock_skew_minutes: int = 15
+
 
 class GreenhouseSource(BaseModel):
     company: str
